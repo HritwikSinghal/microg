@@ -1,0 +1,105 @@
+# microG Universal Installer -- build-time manifest (source of truth).
+#
+# Pinned facts the hermetic build resolves: per component the package, type,
+# partition, versionCode, source, url, APK sha256, and signer-cert sha256.
+# Edited ONLY on a microG bump, by tools/bump (the one network-trusting step).
+#
+# Trust anchors (3, see design spec section 5.4 / 6):
+#   version_code        -- what the device PackageManager compares.
+#   sha256              -- integrity: exactly which APK bytes (changes per release).
+#   signer_cert_sha256  -- authenticity: who published (stable trust root).
+#                          A change here is a SECURITY EVENT, never an auto-bump
+#                          (tools/bump hard-fails; see design spec section 6.2).
+#
+# sha256 = "PENDING-BUMP" is the sentinel for "no real hash pinned yet".
+# build.sh refuses to build while any non-deferred component is PENDING-BUMP --
+# correct and intended until `tools/bump` runs and fills the real hashes.
+#
+# microG signing cert SHA-256 (signs GmsCore / GsfProxy / FakeStore, and the
+# F-Droid repo index): 9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165
+
+schema_version = 1
+
+# microG Services Core -- mandatory core component.
+# Standard build (not -hw / -user). v0.3.15.x, versionCode 250932030.
+# GmsCore release-asset URL pattern:
+#   github.com/microg/GmsCore/releases/download/v<ver>/com.google.android.gms-<versionCode>.apk
+# TODO(bump): confirm the exact release tag. The tag below follows the observed
+# microG convention (v<semver>) but could not be verified offline; tools/bump
+# resolves the real latest tag + asset and overwrites this url.
+[[apk]]
+name               = "GmsCore"
+package            = "com.google.android.gms"
+type               = "app"
+partition          = "product"
+version_code       = 250932030
+source             = "github"
+url                = "https://github.com/microg/GmsCore/releases/download/v0.3.15.0/com.google.android.gms-250932030.apk"
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+conflicts          = []
+
+# GsfProxy -- legacy Google Services Framework shim. microG-signed.
+# Shipped from the same microG GmsCore repo's release assets (and mirrored on
+# F-Droid). source=github keeps it on the same trust root as GmsCore.
+# TODO(bump): confirm the GsfProxy asset name / versionCode; resolved by tools/bump.
+[[apk]]
+name               = "GsfProxy"
+package            = "com.google.android.gsf"
+type               = "app"
+partition          = "product"
+version_code       = 0
+source             = "github"
+url                = "https://github.com/microg/GmsCore/releases/download/v0.3.15.0/com.google.android.gsf-9.apk"
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+conflicts          = []
+
+# FakeStore (microG Companion) -- default store stub. microG-signed.
+# Mutually exclusive with Phonesky (same package com.android.vending).
+# TODO(bump): confirm the FakeStore / Companion asset name + versionCode.
+[[apk]]
+name               = "FakeStore"
+package            = "com.android.vending"
+type               = "app"
+partition          = "product"
+version_code       = 0
+source             = "github"
+url                = "https://github.com/microg/FakeStore/releases/download/v0.1.0/com.android.vending-7.apk"
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+conflicts          = ["Phonesky"]
+
+# MapsV1 -- com.google.android.maps shared-library JAR (NOT an apk).
+# type = "framework": the asset is maps.jar and goes to <part>/framework plus a
+# permissions XML. fetch verifies sha256 ONLY (a JAR is not apksigner-verifiable),
+# so signer_cert_sha256 is a documented placeholder.
+# TODO(bump): MapsV1 has no GitHub/F-Droid release; it is typically vendored from
+# a known-good source. tools/bump cannot resolve it automatically -- pin the url +
+# sha256 by hand and leave version_code as the convention 1.
+[[apk]]
+name               = "MapsV1"
+package            = "com.google.android.maps"
+type               = "framework"
+partition          = "product"
+version_code       = 1
+source             = "github"
+url                = "https://github.com/microg/android_packages_apps_GmsCore/raw/master/maps-api-v1/maps.jar"
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "n-a-framework-jar"
+conflicts          = []
+
+# Phonesky (real Google Play Store) -- Google-signed (DIFFERENT cert from microG).
+# Phase 2: no stable redistributable URL (design spec open question 12).
+# DEFERRED: url = "" -> tools/bump and components.conf both skip it.
+[[apk]]
+name               = "Phonesky"
+package            = "com.android.vending"
+type               = "app"
+partition          = "product"
+version_code       = 0
+source             = "github"
+url                = ""  # Phase 2: no stable redistributable URL; bump skips this
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "TODO-phase2"
+conflicts          = ["FakeStore"]

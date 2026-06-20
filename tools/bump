@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""tools/bump -- the ONE network-trusting step; rewrites manifest.toml in place.
+
+For each non-deferred component, bump:
+  1. resolves the latest release artifact
+       source=github -> GitHub releases API (latest non-draft release; pick the
+                        asset matching the component's package),
+       source=fdroid -> F-Droid index-v2.json (latest version for the package),
+  2. downloads that artifact to a temp dir,
+  3. reads its versionCode (via aapt2 / apkanalyzer if available, else inferred
+     from the asset filename / release tag),
+  4. computes the APK sha256,
+  5. reads the signer-certificate SHA-256 (apksigner verify --print-certs),
+  6. writes versionCode + url + sha256 back into manifest.toml.
+
+SIGNER-CERT GATE (design spec section 6.2): if a newly-read signer_cert_sha256
+differs from the value already committed in manifest.toml, bump ABORTS with a
+loud security warning and a non-zero exit. A new signing key on a privileged-app
+install path is a security event, never an auto-bump. bump never rewrites a
+signer cert.
+
+Deferred components (empty url -- e.g. Phonesky) are skipped: no stable
+redistributable URL exists yet (design spec open question 12). type=framework
+components (maps.jar) have no GitHub/F-Droid release to resolve and no
+apksigner-verifiable signature, so bump skips them too and leaves a note --
+their url + sha256 are pinned by hand.
+
+This tool TRUSTS the network by design and is run intentionally; build.sh stays
+hermetic and verifies the static pins this tool writes.
+
+Requires Python 3.11+ (stdlib tomllib for reading; the file is rewritten with a
+hand-rolled, comment-preserving line editor since stdlib has no TOML writer).
+
+Usage:
+  tools/bump [--manifest PATH] [--only NAME[,NAME...]] [--dry-run]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final
+
+PENDING_BUMP: Final[str] = "PENDING-BUMP"
+SCHEMA_VERSION_SUPPORTED: Final[int] = 1
+
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
+DEFAULT_MANIFEST: Final[Path] = _REPO_ROOT / "manifest.toml"
+
+GITHUB_API: Final[str] = "https://api.github.com"
+# Public F-Droid repo index. A component on source=fdroid is assumed to live in
+# the microG F-Droid repo (signed by the same microG cert); override per-need.
+FDROID_INDEX_URL: Final[str] = "https://microg.org/fdroid/repo/index-v2.json"
+FDROID_REPO_BASE: Final[str] = "https://microg.org/fdroid/repo"
+
+_HTTP_TIMEOUT: Final[int] = 60
+_USER_AGENT: Final[str] = "microg-installer-bump/1"
+
+
+class BumpError(Exception):
+    """A recoverable bump failure (network, parse, missing tool)."""
+
+
+class SignerCertChanged(BumpError):
+    """The signer cert changed -- a security event; bump must abort hard."""
+
+
+@dataclass
+class Component:
+    """A mutable view of one [[apk]] entry, parsed from manifest.toml."""
+
+    name: str
+    package: str
+    type: str
+    source: str
+    url: str
+    sha256: str
+    signer_cert_sha256: str
+    version_code: int
+
+    @property
+    def is_deferred(self) -> bool:
+        return self.url.strip() == ""
+
+    @property
+    def is_framework(self) -> bool:
+        return self.type == "framework"
+
+
+# --------------------------------------------------------------------------- #
+# manifest parsing (read) -- reuse tomllib; no external deps.
+# --------------------------------------------------------------------------- #
+
+
+def load_components(path: Path) -> list[Component]:
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except FileNotFoundError as exc:
+        raise BumpError(f"manifest not found: {path}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise BumpError(f"manifest is not valid TOML: {exc}") from exc
+
+    if data.get("schema_version") != SCHEMA_VERSION_SUPPORTED:
+        raise BumpError(
+            f"unsupported schema_version {data.get('schema_version')!r}"
+        )
+
+    raw_apks = data.get("apk")
+    if not isinstance(raw_apks, list) or not raw_apks:
+        raise BumpError("manifest has no [[apk]] entries")
+
+    components: list[Component] = []
+    for raw in raw_apks:
+        components.append(
+            Component(
+                name=str(raw["name"]),
+                package=str(raw["package"]),
+                type=str(raw["type"]),
+                source=str(raw["source"]),
+                url=str(raw.get("url", "")),
+                sha256=str(raw["sha256"]),
+                signer_cert_sha256=str(raw["signer_cert_sha256"]),
+                version_code=int(raw["version_code"]),
+            )
+        )
+    return components
+
+
+# --------------------------------------------------------------------------- #
+# HTTP helpers
+# --------------------------------------------------------------------------- #
+
+
+def _http_get(url: str, accept: str | None = None) -> bytes:
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", _USER_AGENT)
+    if accept:
+        req.add_header("Accept", accept)
+    try:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        raise BumpError(f"HTTP {exc.code} fetching {url}") from exc
+    except urllib.error.URLError as exc:
+        raise BumpError(f"network error fetching {url}: {exc.reason}") from exc
+
+
+def _http_get_json(url: str) -> dict:
+    raw = _http_get(url, accept="application/json")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BumpError(f"invalid JSON from {url}: {exc}") from exc
+
+
+def _download(url: str, dest: Path) -> None:
+    data = _http_get(url)
+    if not data:
+        raise BumpError(f"download produced no bytes: {url}")
+    dest.write_bytes(data)
+
+
+# --------------------------------------------------------------------------- #
+# release resolution
+# --------------------------------------------------------------------------- #
+
+# A microG GitHub repo path is inferred from source=github. We derive the owner/
+# repo from the existing url when possible (most robust), else fall back to a
+# package->repo guess. The existing manifest urls all point at github.com/microg/
+# <Repo>/releases/..., so parsing the committed url is the primary path.
+_GITHUB_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/releases/"
+)
+
+
+def _github_owner_repo(component: Component) -> tuple[str, str]:
+    match = _GITHUB_URL_RE.match(component.url)
+    if match:
+        return match.group("owner"), match.group("repo")
+    # Fallback guess: microG hosts each artifact in its own repo. This is a best
+    # effort -- if it is wrong, the API call 404s and bump reports it clearly.
+    # TODO: confirm the canonical repo per package if the committed url is ever
+    # blanked. Known: GmsCore/GsfProxy -> microG/GmsCore, FakeStore -> microG/FakeStore.
+    raise BumpError(
+        f"{component.name}: cannot derive GitHub owner/repo from url "
+        f"{component.url!r}; pin a valid releases url first"
+    )
+
+
+@dataclass
+class ResolvedArtifact:
+    url: str
+    # versionCode parsed from the tag/filename, if derivable; None if unknown
+    # (then we rely on aapt2/apkanalyzer reading it from the APK).
+    version_code_hint: int | None
+
+
+def _resolve_github(component: Component) -> ResolvedArtifact:
+    owner, repo = _github_owner_repo(component)
+    api = f"{GITHUB_API}/repos/{owner}/{repo}/releases/latest"
+    release = _http_get_json(api)
+
+    assets = release.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise BumpError(f"{component.name}: latest release has no assets ({api})")
+
+    # Pick the asset whose name contains the package and ends in .apk.
+    # microG asset convention: <package>-<versionCode>.apk
+    candidates = [
+        a
+        for a in assets
+        if isinstance(a, dict)
+        and isinstance(a.get("name"), str)
+        and component.package in a["name"]
+        and a["name"].endswith(".apk")
+    ]
+    if not candidates:
+        names = [a.get("name") for a in assets if isinstance(a, dict)]
+        raise BumpError(
+            f"{component.name}: no asset matching package {component.package!r} "
+            f".apk in latest release; assets were {names}"
+        )
+    if len(candidates) > 1:
+        # Prefer the shortest name (avoids -hw / -debug variants).
+        candidates.sort(key=lambda a: len(a["name"]))
+    asset = candidates[0]
+
+    download_url = asset.get("browser_download_url")
+    if not isinstance(download_url, str) or not download_url:
+        raise BumpError(f"{component.name}: asset has no browser_download_url")
+
+    return ResolvedArtifact(
+        url=download_url,
+        version_code_hint=_version_code_from_name(asset["name"]),
+    )
+
+
+def _resolve_fdroid(component: Component) -> ResolvedArtifact:
+    """Resolve the latest artifact from an F-Droid index-v2.json.
+
+    index-v2 shape (relevant subset):
+      {
+        "packages": {
+          "<applicationId>": {
+            "metadata": {...},
+            "versions": {
+              "<apk-sha256>": {
+                "added": <ms>,
+                "file": {"name": "/<pkg>_<versionCode>.apk", "sha256": "..."},
+                "manifest": {"versionCode": <int>, "versionName": "..."}
+              },
+              ...
+            }
+          }
+        }
+      }
+    We pick the version with the highest manifest.versionCode.
+    """
+    index = _http_get_json(FDROID_INDEX_URL)
+    packages = index.get("packages")
+    if not isinstance(packages, dict):
+        raise BumpError("F-Droid index-v2 has no 'packages' map")
+
+    entry = packages.get(component.package)
+    if not isinstance(entry, dict):
+        raise BumpError(
+            f"{component.name}: package {component.package!r} not in F-Droid index"
+        )
+
+    versions = entry.get("versions")
+    if not isinstance(versions, dict) or not versions:
+        raise BumpError(f"{component.name}: no versions in F-Droid index")
+
+    best_vc = -1
+    best_file_name: str | None = None
+    for ver in versions.values():
+        if not isinstance(ver, dict):
+            continue
+        manifest = ver.get("manifest", {})
+        file_obj = ver.get("file", {})
+        vc = manifest.get("versionCode") if isinstance(manifest, dict) else None
+        name = file_obj.get("name") if isinstance(file_obj, dict) else None
+        if isinstance(vc, int) and isinstance(name, str) and vc > best_vc:
+            best_vc = vc
+            best_file_name = name
+
+    if best_file_name is None:
+        raise BumpError(f"{component.name}: could not find a usable F-Droid version")
+
+    # file.name is repo-relative and starts with '/'.
+    url = FDROID_REPO_BASE + best_file_name
+    hint = best_vc if best_vc >= 0 else _version_code_from_name(best_file_name)
+    return ResolvedArtifact(url=url, version_code_hint=hint)
+
+
+_VC_IN_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[-_](\d+)\.apk$")
+
+
+def _version_code_from_name(name: str) -> int | None:
+    """Parse a trailing -<digits>.apk or _<digits>.apk as the versionCode."""
+    match = _VC_IN_NAME_RE.search(name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# APK inspection: versionCode + signer cert
+# --------------------------------------------------------------------------- #
+
+
+def _have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _run(cmd: list[str]) -> str:
+    proc = subprocess.run(  # noqa: S603 - args are tool names + local paths
+        cmd, capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        raise BumpError(
+            f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+def _read_version_code(apk: Path, hint: int | None) -> int:
+    """Read versionCode from the APK; fall back to the tag/filename hint.
+
+    Prefers apkanalyzer, then aapt2. If neither is available, uses the hint
+    parsed from the asset name -- which for microG follows <pkg>-<versionCode>.apk.
+    """
+    if _have("apkanalyzer"):
+        out = _run(["apkanalyzer", "manifest", "version-code", str(apk)])
+        text = out.strip()
+        if text.isdigit():
+            return int(text)
+
+    if _have("aapt2"):
+        out = _run(["aapt2", "dump", "badging", str(apk)])
+        # line: package: name='...' versionCode='12345' versionName='...'
+        match = re.search(r"versionCode='(\d+)'", out)
+        if match:
+            return int(match.group(1))
+
+    if hint is not None:
+        print(
+            f"  note: no aapt2/apkanalyzer; using versionCode={hint} parsed "
+            f"from the asset filename",
+            file=sys.stderr,
+        )
+        return hint
+
+    raise BumpError(
+        f"cannot determine versionCode for {apk.name}: install aapt2 or "
+        f"apkanalyzer, or ensure the asset name encodes it (<pkg>-<code>.apk)"
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_CERT_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    r"certificate SHA-256 digest:\s*([0-9a-fA-F:]+)", re.IGNORECASE
+)
+
+
+def _read_signer_cert_sha256(apk: Path) -> str:
+    """Read the signing CERTIFICATE SHA-256 via apksigner (not the public key).
+
+    apksigner labels the line either:
+      "Signer #1 certificate SHA-256 digest: <hex>"            (v1/v2)
+      "Signer (minSdkVersion=..) certificate SHA-256 digest: <hex>"  (v3)
+    The regex requires the word "certificate", so the "public key SHA-256
+    digest:" lines are never matched.
+    """
+    if not _have("apksigner"):
+        raise BumpError("apksigner not found; required to read the signer cert")
+
+    proc = subprocess.run(  # noqa: S603
+        ["apksigner", "verify", "--print-certs", str(apk)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise BumpError(
+            f"apksigner verify failed for {apk.name} "
+            f"(invalid/missing signature): {proc.stderr.strip()}"
+        )
+
+    match = _CERT_LINE_RE.search(proc.stdout)
+    if not match:
+        raise BumpError(
+            f"could not find 'certificate SHA-256 digest:' for {apk.name}"
+        )
+    return match.group(1).replace(":", "").lower()
+
+
+# --------------------------------------------------------------------------- #
+# manifest rewriting (comment-preserving, per-field, in place)
+# --------------------------------------------------------------------------- #
+
+
+def _set_field(lines: list[str], block: tuple[int, int], key: str, value: str) -> bool:
+    """Set `key = value` within lines[block[0]:block[1]]. value is raw TOML text.
+
+    Returns True if a line was rewritten. Preserves inline comments only when the
+    key had none; if the existing line carried a trailing comment we drop it for
+    the rewritten fields (sha256/url/version_code), since a stale comment there
+    would be misleading after a bump.
+    """
+    start, end = block
+    key_re = re.compile(rf"^(\s*){re.escape(key)}(\s*)=")
+    for i in range(start, end):
+        if key_re.match(lines[i]):
+            indent = key_re.match(lines[i]).group(1)
+            lines[i] = f"{indent}{key:<18} = {value}\n"
+            return True
+    return False
+
+
+def _find_blocks(lines: list[str]) -> list[tuple[str, tuple[int, int]]]:
+    """Return [(component_name, (start_line, end_line)), ...] for each [[apk]].
+
+    A block runs from its '[[apk]]' header to just before the next '[[apk]]'
+    header (or EOF). The name is read from the block's `name = "..."` line.
+    """
+    header_idxs = [i for i, ln in enumerate(lines) if ln.strip() == "[[apk]]"]
+    blocks: list[tuple[str, tuple[int, int]]] = []
+    for n, start in enumerate(header_idxs):
+        end = header_idxs[n + 1] if n + 1 < len(header_idxs) else len(lines)
+        name = None
+        name_re = re.compile(r'^\s*name\s*=\s*"([^"]+)"')
+        for i in range(start, end):
+            m = name_re.match(lines[i])
+            if m:
+                name = m.group(1)
+                break
+        if name is None:
+            raise BumpError(f"[[apk]] block at line {start + 1} has no name field")
+        blocks.append((name, (start, end)))
+    return blocks
+
+
+def _toml_str(value: str) -> str:
+    """Render a Python str as a double-quoted TOML basic string."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+# --------------------------------------------------------------------------- #
+# orchestration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class BumpResult:
+    name: str
+    version_code: int
+    url: str
+    sha256: str
+
+
+def _resolve(component: Component) -> ResolvedArtifact:
+    if component.source == "github":
+        return _resolve_github(component)
+    if component.source == "fdroid":
+        return _resolve_fdroid(component)
+    raise BumpError(f"{component.name}: unknown source {component.source!r}")
+
+
+def bump_component(component: Component, workdir: Path) -> BumpResult:
+    """Resolve, download, inspect one component. Enforces the signer-cert gate.
+
+    Raises SignerCertChanged if the new cert differs from the committed one.
+    """
+    print(f"[{component.name}] resolving latest from {component.source}...", file=sys.stderr)
+    artifact = _resolve(component)
+    print(f"[{component.name}] artifact: {artifact.url}", file=sys.stderr)
+
+    apk_path = workdir / f"{component.name}.apk"
+    _download(artifact.url, apk_path)
+
+    sha256 = _sha256_file(apk_path)
+    version_code = _read_version_code(apk_path, artifact.version_code_hint)
+
+    # SIGNER-CERT GATE -- only applies to type=app (a JAR has no apksigner cert).
+    new_cert = _read_signer_cert_sha256(apk_path)
+    committed = component.signer_cert_sha256.replace(":", "").lower()
+    if new_cert != committed:
+        raise SignerCertChanged(
+            f"\n"
+            f"  *** SIGNER CERTIFICATE CHANGED for {component.name} ***\n"
+            f"  committed: {committed}\n"
+            f"  resolved:  {new_cert}\n"
+            f"  A new signing key on a privileged-app install path is a SECURITY\n"
+            f"  EVENT, not a version bump. bump will NOT auto-update a signer cert.\n"
+            f"  If this change is legitimate, update signer_cert_sha256 by hand\n"
+            f"  after verifying the new key out-of-band, then re-run bump."
+        )
+
+    return BumpResult(
+        name=component.name,
+        version_code=version_code,
+        url=artifact.url,
+        sha256=sha256,
+    )
+
+
+def apply_results(
+    manifest_path: Path, results: list[BumpResult], dry_run: bool
+) -> None:
+    """Rewrite version_code / url / sha256 for each result, preserving comments."""
+    lines = manifest_path.read_text(encoding="ascii").splitlines(keepends=True)
+    blocks = dict(_find_blocks(lines))
+
+    for result in results:
+        block = blocks.get(result.name)
+        if block is None:
+            raise BumpError(f"no [[apk]] block named {result.name!r} to update")
+        _set_field(lines, block, "version_code", str(result.version_code))
+        _set_field(lines, block, "url", _toml_str(result.url))
+        _set_field(lines, block, "sha256", _toml_str(result.sha256))
+
+    new_text = "".join(lines)
+    if dry_run:
+        print("--- dry-run: manifest would become ---", file=sys.stderr)
+        sys.stdout.write(new_text)
+        return
+    manifest_path.write_text(new_text, encoding="ascii")
+    print(f"updated {manifest_path}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--only",
+        default=None,
+        help="comma-separated component names to bump (default: all eligible)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the would-be manifest to stdout; do not write",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        components = load_components(args.manifest)
+    except BumpError as exc:
+        print(f"bump: {exc}", file=sys.stderr)
+        return 1
+
+    only: set[str] | None = None
+    if args.only:
+        only = {n.strip() for n in args.only.split(",") if n.strip()}
+
+    results: list[BumpResult] = []
+    skipped: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="microg-bump-") as tmp:
+        workdir = Path(tmp)
+        for component in components:
+            if only is not None and component.name not in only:
+                continue
+
+            if component.is_deferred:
+                # Phonesky and friends: no stable redistributable URL.
+                skipped.append(f"{component.name} (deferred: empty url)")
+                continue
+            if component.is_framework:
+                # maps.jar: no GitHub/F-Droid release and no apksigner signature.
+                # Pinned by hand; bump cannot resolve it.
+                skipped.append(f"{component.name} (framework JAR: pin by hand)")
+                continue
+
+            try:
+                results.append(bump_component(component, workdir))
+            except SignerCertChanged as exc:
+                # Hard, loud failure -- never proceed past a cert change.
+                print(str(exc), file=sys.stderr)
+                return 2
+            except BumpError as exc:
+                print(f"bump: {component.name}: {exc}", file=sys.stderr)
+                return 1
+
+        if not results:
+            print("bump: nothing to do (no eligible components)", file=sys.stderr)
+            for note in skipped:
+                print(f"  skipped: {note}", file=sys.stderr)
+            return 0
+
+        try:
+            apply_results(args.manifest, results, args.dry_run)
+        except BumpError as exc:
+            print(f"bump: {exc}", file=sys.stderr)
+            return 1
+
+    for result in results:
+        print(
+            f"  bumped {result.name}: versionCode={result.version_code} "
+            f"sha256={result.sha256[:12]}...",
+            file=sys.stderr,
+        )
+    for note in skipped:
+        print(f"  skipped: {note}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
