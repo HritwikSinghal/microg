@@ -1,0 +1,6 @@
+id=microg-installer
+name=microG Universal Installer
+version=v0.1.0
+versionCode=1
+author=microg-installer contributors
+description=Installs microG as privileged system apps via a systemless overlay. Works on Magisk, KernelSU, and APatch. No signature spoofing is bundled (see the spoofing guide).
