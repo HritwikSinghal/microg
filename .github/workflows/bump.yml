@@ -1,0 +1,67 @@
+name: bump
+
+# RESOLVE stage (design spec section 6): the ONLY network-trusting step.
+# Reaches GitHub releases / the F-Droid index, reads each component's new
+# versionCode + APK sha256 + signer cert, and rewrites manifest.toml. Kept out
+# of build.yml so the build stays hermetic. Runs on demand or weekly, and opens
+# a PR -- a human reviews the diff (and the resulting hermetic build) before it
+# lands on master.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android build-tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "build-tools;34.0.0" "cmdline-tools;latest"
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+      - name: Snapshot current manifest
+        run: cp manifest.toml manifest.toml.orig
+
+      - name: Resolve latest pins (rewrite manifest.toml)
+        run: python3 tools/bump
+
+      - name: Signer-cert gate (a cert change is a security event, never auto-bump)
+        run: python3 lib/invariant.py check-signer --old manifest.toml.orig --new manifest.toml
+
+      - name: Discard snapshot
+        run: rm -f manifest.toml.orig
+
+      - name: Open a pull request with the bumped manifest
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: manifest.toml
+          branch: automated/manifest-bump
+          commit-message: 'bump: update pinned microG component versions'
+          title: 'bump: update pinned microG component versions'
+          body: |
+            Automated manifest bump (RESOLVE stage).
+
+            The signer-cert gate passed (no signing key changed). Review the
+            version/hash diff, then let the hermetic `build` workflow verify the
+            new pins on this PR before merging.
