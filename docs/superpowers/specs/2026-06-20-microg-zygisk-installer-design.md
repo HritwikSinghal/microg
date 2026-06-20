@@ -46,6 +46,9 @@ Non-goals (Phase 1):
 | XML generation | Build-time, with CI invariant | On-device aapt is fat/fragile; CI is where bootloop prevention is strongest. |
 | Spoofing guide timing | Parallel / anytime | Pure research+writing, no code dependency. |
 | APK sourcing | CI downloads, SHA-pinned | Small repo, matches micro5k; no committed binaries. |
+| Build hermeticity | Split `bump` (reaches network, rewrites manifest) from `build` (hermetic, verifies against static pins) | MinMicroG fused "find latest" with "build" -> non-reproducible. A pure build = same manifest in, byte-identical zip out. |
+| APK trust anchors | Pin 3: versionCode + APK sha256 + signer-cert sha256 | File hash = integrity (changes per release); signer cert = authenticity (stable trust root); versionCode = what the device compares. |
+| Signer-cert change | Hard CI failure on bump; never auto-update | A new signing key on a privileged-app install path is a security event, not a version bump. One check defends all of /system/priv-app. |
 
 ## 4. Components installed
 
@@ -111,7 +114,39 @@ NOT inferred from the root manager, since KSU can be configured either way.
 Whiteout/removal semantics differ between engines; the `REPLACE` sentinel is the
 portable path.
 
-### 5.4 Data-driven component manifest
+### 5.4 Two manifests, two audiences (do not merge)
+
+There are deliberately two data files; merging them couples build-time secrets
+(urls/hashes/signers) to the on-device interpreter, which needs none of them.
+
+- `manifest.toml` (build-time, source of truth) -- pinned facts the build resolves:
+  per component its package, type, partition, versionCode, source, url, APK
+  sha256, and signer-cert sha256. Edited only on a microG bump (by `bump`, see 6).
+  Schema:
+
+  ```toml
+  schema_version = 1
+
+  [[apk]]
+  name               = "GmsCore"
+  package            = "com.google.android.gms"
+  type               = "app"            # app | framework
+  partition          = "product"
+  version_code       = 244735
+  source             = "github"         # github | fdroid
+  url                = "https://github.com/microg/GmsCore/releases/download/v0.3.6.244735/com.google.android.gms-244735.apk"
+  sha256             = "<apk file hash>"     # integrity: which bytes
+  signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"  # authenticity: who published
+  conflicts          = []               # e.g. FakeStore <-> Phonesky
+  ```
+
+  microG signing cert SHA-256 (authenticity anchor for downloads; also signs the
+  F-Droid repo index): `9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165`.
+
+- `components.conf` (install-time, generated) -- the slim row table the on-device
+  `customize.sh` interprets. Emitted FROM `manifest.toml` during packaging (Stage
+  3) so the two cannot drift. Holds only what the device needs: name, pkg, asset,
+  partition, type, perms, conflicts. No urls/hashes.
 
 `components.conf` declares each component as a row; `customize.sh` is a generic
 interpreter over it (iterate -> place -> collect XML -> resolve conflicts). Adding
@@ -131,17 +166,62 @@ A `type` discriminator distinguishes a normal priv-app from a framework JAR
 
 ## 6. Build and CI
 
-- `build.sh`: reads pinned versions+SHA-256 from a manifest, downloads microG
-  (GitHub releases) and Phonesky (mirror), verifies SHA, generates permission XMLs
-  from the actual APK manifests (build-time, using aapt2 on the CI host),
-  assembles the ZIP. No committed binaries.
-- GitHub Actions: runs `build.sh`, uploads the ZIP artifact / release.
-- CI permission-invariant gate (the permanent bootloop cure): for each bundled
-  APK, extract the set of requested permissions whose protectionLevel includes
-  `privileged`, and assert:
-  - requested_privileged is a subset of the generated privapp-permissions allowlist, AND
-  - every entry in default-permissions is actually declared by the APK.
-  A mismatched microG bump becomes literally unbuildable.
+Three strictly separated stages; the boundaries are the design:
+
+```
+[1] RESOLVE          [2] BUILD (hermetic)            [3] PACKAGE
+manifest.toml   -->  download + 3-anchor verify      assemble zip
+(pinned facts)       gen permission XMLs from APKs    emit components.conf
+                     run permission invariant         (pure file moves)
+```
+
+- `bump` (separate tool, NOT part of build): reaches F-Droid (`index-v2.json` /
+  `<pkg>_<versionCode>.apk`) or GitHub releases, reads the new versionCode + APK
+  sha256 + signer cert, and rewrites `manifest.toml`. The only network-trusting
+  step, and only run intentionally.
+- `build.sh` (hermetic): trusts nothing remote. For each `[[apk]]` it downloads
+  the pinned `url`, then verifies THREE anchors before use:
+  1. `sha256sum -c` against `manifest.toml` `sha256` (integrity),
+  2. `apksigner verify` exits 0 (valid signature),
+  3. `apksigner verify --print-certs` certificate SHA-256 == `signer_cert_sha256`
+     (publisher authenticity). Grep `certificate SHA-256 digest:` (v3 labels it
+     `Signer (minSdkVersion=..) certificate ...`), not `Signer #1`; use the cert
+     digest, not the public-key digest. Prefer `apksigner` over keytool/openssl
+     (those read only v1/JAR certs, missing v2/v3-only signers).
+  Then it generates permission XMLs (Section 6.1) and assembles the ZIP, emitting
+  the slim `components.conf` from the manifest. Same manifest in -> identical zip.
+- GitHub Actions: runs `build.sh`, the invariants below, uploads the ZIP.
+
+### 6.1 Permission XML generation (intersection, not copy)
+
+An APK manifest lists which permissions are REQUESTED, not which are
+`privileged` -- protection levels live in the platform
+(`frameworks/base/core/res/AndroidManifest.xml`), not the APK. So the
+privapp-permissions allowlist is an intersection, generated per target API:
+
+```
+granted = requested(APK)  INTERSECT  privileged_perms(target AOSP API)
+        + FAKE_PACKAGE_SIGNATURE   # microG-custom, absent from stock AOSP
+```
+
+- requested: `apkanalyzer manifest permissions X.apk` (fallback `aapt2 dump permissions`).
+- privileged_perms: parse `protectionLevel` containing `privileged` from the AOSP
+  `core/res` manifest for the target API (union a couple API levels to be safe).
+- Under-list -> bootloop under `enforce` (stock default); over-list -> harmless.
+  Prefer the superset when uncertain.
+- Behavioral exemptions (`allow-in-power-save`, `allow-unthrottled-location`) go
+  in a SEPARATE `sysconfig-microg.xml` -- NOT boot-critical, must not pollute the
+  allowlist.
+
+### 6.2 CI invariant gates (the permanent bootloop cure)
+
+- Permission invariant: for each bundled APK, `requested_privileged` is a subset
+  of the generated privapp-permissions allowlist, AND every entry in
+  default-permissions is actually declared by the APK. A mismatched microG bump
+  becomes literally unbuildable. Validate generated XML with `xmllint --noout`.
+- Signer-cert gate: refuse any bump where a component's `signer_cert_sha256`
+  differs from its previous value. A signer change on a privileged-app path is a
+  security event, never an auto-bump.
 
 ## 7. Error handling and edge cases (must-handle checklist)
 
