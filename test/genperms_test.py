@@ -381,7 +381,7 @@ class CliIntegrationTests(unittest.TestCase):
                     FAKE,
                 },
                 privileged=genperms.load_privileged_perms(34, REPO_ROOT / "data"),
-                out_path=perms / "GmsCore.xml",
+                out_path=perms / "gmscore.xml",
             )
             manifest = root / "manifest.toml"
             manifest.write_text(
@@ -429,7 +429,7 @@ class CliIntegrationTests(unittest.TestCase):
                 package="com.google.android.gms",
                 requested={"android.permission.WRITE_SECURE_SETTINGS"},
                 privileged={"android.permission.WRITE_SECURE_SETTINGS"},
-                out_path=perms / "GmsCore.xml",
+                out_path=perms / "gmscore.xml",
             )
             manifest = root / "manifest.toml"
             manifest.write_text(
