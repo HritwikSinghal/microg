@@ -33,7 +33,7 @@ partition          = "product"
 version_code       = 250932030
 source             = "fdroid"
 url                = "https://microg.org/fdroid/repo/com.google.android.gms-250932030.apk"
-sha256             = "PENDING-BUMP"
+sha256             = "52597e77fd25fdd347574d0457ed1936a4b9561cf4c8d34e7ac8dd8191dfd4b9"
 signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
 conflicts          = []
 
@@ -50,7 +50,7 @@ partition          = "product"
 version_code       = 8
 source             = "fdroid"
 url                = "https://microg.org/fdroid/repo/com.google.android.gsf-8.apk"
-sha256             = "PENDING-BUMP"
+sha256             = "86891b174301f06a1c84187b545a0a2a57044c6b768f3e84e865908743349692"
 signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
 conflicts          = []
 
@@ -66,7 +66,7 @@ partition          = "product"
 version_code       = 84022630
 source             = "fdroid"
 url                = "https://microg.org/fdroid/repo/com.android.vending-84022630.apk"
-sha256             = "PENDING-BUMP"
+sha256             = "a973e0235a2829773a4faf36d235d5f703d1c04a2adff674ebaa535a2e78f937"
 signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
 conflicts          = ["Phonesky"]
 
