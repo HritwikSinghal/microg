@@ -128,14 +128,65 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && needs.build.outputs.bumped == 'true'
     runs-on: ubuntu-latest
     steps:
+      # Full history so the changelog can diff against the previous tag, and so
+      # module.prop (the version/versionCode source of truth) is available.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download built ZIP
         uses: actions/download-artifact@v4
         with:
           name: microg-installer-zip
           path: out
 
+      # In-app auto-update feed read by the Magisk/KernelSU/KernelSU-Next/APatch
+      # managers via module.prop's updateJson. update.json is published under the
+      # FIXED "latest" asset name so module.prop points at one stable URL forever;
+      # its contents reference this release's versioned zip + changelog.
+      - name: Generate update.json + changelog
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version=//p' module.prop | head -n1)"
+          version_code="$(sed -n 's/^versionCode=//p' module.prop | head -n1)"
+          case "$version_code" in ''|*[!0-9]*) echo "module.prop versionCode is not numeric: '$version_code'" >&2; exit 1 ;; esac
+          # The module (systemless) zip is the manager-installed artifact that
+          # auto-update targets. Today build.sh emits one zip; when a system-mode
+          # zip is added (Phase 3) select the module one explicitly here.
+          zip_name="$(cd out && ls -1 ./*.zip | sed 's#^\./##' | head -n1)"
+          base="https://github.com/${REPO}/releases"
+
+          cat > out/update.json <<EOF
+          {
+            "version": "${version}",
+            "versionCode": ${version_code},
+            "zipUrl": "${base}/download/${TAG}/${zip_name}",
+            "changelog": "${base}/latest/download/changelog.md"
+          }
+          EOF
+
+          prev="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          {
+            echo "# ${version}"
+            echo
+            if [ -n "$prev" ]; then
+              git log --no-merges --pretty='- %s' "${prev}..${TAG}"
+            else
+              git log --no-merges --pretty='- %s' "${TAG}"
+            fi
+          } > out/changelog.md
+
+          echo "--- update.json ---"; cat out/update.json
+          echo "--- changelog.md ---"; cat out/changelog.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: out/*.zip
+          files: |
+            out/*.zip
+            out/update.json
+            out/changelog.md
           generate_release_notes: true
