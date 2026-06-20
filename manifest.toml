@@ -74,18 +74,21 @@ conflicts          = ["Phonesky"]
 # type = "framework": the asset is maps.jar and goes to <part>/framework plus a
 # permissions XML. fetch verifies sha256 ONLY (a JAR is not apksigner-verifiable),
 # so signer_cert_sha256 is a documented placeholder.
-# TODO(bump): MapsV1 has no GitHub/F-Droid release; it is typically vendored from
-# a known-good source. tools/bump cannot resolve it automatically -- pin the url +
-# sha256 by hand and leave version_code as the convention 1.
+# source = "vendored": there is no stable bare-jar download URL (microG's
+# android_frameworks_mapsv1 ships only a flashable zip), so -- following the
+# working micro5k/microg-unofficial-installer reference -- the jar is committed
+# in-repo at the url path below and the build copies + sha256-verifies it.
+# This is the ONE committed binary: a tiny (143 KB), immutable, FLOSS framework
+# lib. tools/bump skips it (framework). version_code 9 matches micro5k.
 [[apk]]
 name               = "MapsV1"
 package            = "com.google.android.maps"
 type               = "framework"
 partition          = "product"
-version_code       = 1
-source             = "github"
-url                = "https://github.com/microg/android_packages_apps_GmsCore/raw/master/maps-api-v1/maps.jar"
-sha256             = "PENDING-BUMP"
+version_code       = 9
+source             = "vendored"
+url                = "vendor/com.google.android.maps.jar"
+sha256             = "a3e12a952183473de8f1725d3b01f784f01d35c33f6741bd8875fbdb91ebadae"
 signer_cert_sha256 = "n-a-framework-jar"
 conflicts          = []
 

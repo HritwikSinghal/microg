@@ -105,8 +105,16 @@ for name in "${!URL[@]}"; do
     dest="$STAGE/$asset"
     log "component $name ($asset)"
 
+    # A scheme-less url is a repo-relative vendored file (e.g. MapsV1's in-repo
+    # jar); resolve it to an absolute path so the copy works from any cwd.
+    src_url="${URL[$name]}"
+    case "$src_url" in
+        *://*) : ;;
+        *) src_url="$ROOT/$src_url" ;;
+    esac
+
     fetch_and_verify \
-        "${URL[$name]}" "${SHA[$name]}" "${SIGNER[$name]}" "${FTYPE[$name]}" "$dest" \
+        "$src_url" "${SHA[$name]}" "${SIGNER[$name]}" "${FTYPE[$name]}" "$dest" \
         || die "fetch/verify failed for $name"
 
     # Framework JARs (MapsV1) have no privapp-permissions allowlist; skip perms.

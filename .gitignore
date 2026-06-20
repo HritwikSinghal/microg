@@ -4,8 +4,9 @@
 /out/
 *.zip
 
-# Downloaded, SHA-pinned APKs and the MapsV1 JAR are fetched at build
-# time and verified against manifest.toml; never committed.
+# Downloaded, SHA-pinned APKs are fetched at build time into the staging apks/
+# dir and verified against manifest.toml; never committed. (The MapsV1 jar is the
+# one vendored exception -- committed under vendor/, see manifest.toml.)
 apks/*.apk
 apks/*.jar
 

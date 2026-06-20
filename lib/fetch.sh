@@ -54,8 +54,12 @@ _fetch_sha256() {
     return 1
 }
 
-# _fetch_download <url> <dest> -- download <url> to <dest>, or fail non-zero.
-# Prefers curl; falls back to wget. Fails loudly if neither exists.
+# _fetch_download <url> <dest> -- fetch <url> to <dest>, or fail non-zero.
+#
+# A url WITHOUT a "scheme://" prefix is treated as a local filesystem path and
+# copied (the vendored-source case, e.g. MapsV1's in-repo jar). build.sh resolves
+# such paths to absolute before calling. A url WITH a scheme is downloaded:
+# prefers curl, falls back to wget; fails loudly if neither exists.
 _fetch_download() {
     url="$1"
     dest="$2"
@@ -64,6 +68,26 @@ _fetch_download() {
         _fetch_err "empty url (component may be deferred and should not be fetched)"
         return 1
     fi
+
+    # No "://" scheme -> a local (vendored) file path: copy instead of download.
+    case "$url" in
+        *://*) : ;;  # remote url, fall through to curl/wget
+        *)
+            if [ ! -f "$url" ]; then
+                _fetch_err "vendored file not found: $url"
+                return 1
+            fi
+            if ! cp "$url" "$dest"; then
+                _fetch_err "failed to copy vendored file: $url -> $dest"
+                return 1
+            fi
+            if [ ! -s "$dest" ]; then
+                _fetch_err "vendored file is empty: $url"
+                return 1
+            fi
+            return 0
+            ;;
+    esac
 
     if _fetch_have curl; then
         # -f: fail on HTTP >=400; -L: follow redirects (GitHub assets redirect);
