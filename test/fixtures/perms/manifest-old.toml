@@ -1,0 +1,22 @@
+# Fixture: a tiny "previous" manifest.toml for the signer-cert gate test.
+# Two components with pinned signer certs. The matching manifest-new.toml keeps
+# GmsCore's cert identical (must PASS) and changes FakeStore's (must FAIL).
+schema_version = 1
+
+[[apk]]
+name               = "GmsCore"
+package            = "com.google.android.gms"
+type               = "app"
+version_code       = 250932030
+url                = "https://example/gms.apk"
+sha256             = "aaaa"
+signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+
+[[apk]]
+name               = "FakeStore"
+package            = "com.android.vending"
+type               = "app"
+version_code       = 7
+url                = "https://example/fakestore.apk"
+sha256             = "bbbb"
+signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"

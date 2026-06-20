@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+  <privapp-permissions package="com.google.android.gms">
+    <permission name="android.permission.ACCESS_FINE_LOCATION"/>
+    <permission name="android.permission.ACCESS_NETWORK_STATE"/>
+    <permission name="android.permission.FAKE_PACKAGE_SIGNATURE"/>
+    <permission name="android.permission.UPDATE_APP_OPS_STATS"/>
+    <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+  </privapp-permissions>
+</permissions>

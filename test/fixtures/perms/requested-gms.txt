@@ -1,0 +1,11 @@
+# Fixture: a tiny REQUESTED-permissions list for a fake "GmsCore"-like APK.
+# Hand-written -- NOT extracted from a real APK. Mixes privileged perms, a
+# non-privileged (normal/runtime) perm that must be DROPPED by the intersection,
+# and FAKE_PACKAGE_SIGNATURE which must always survive into the allowlist.
+android.permission.ACCESS_FINE_LOCATION
+android.permission.ACCESS_NETWORK_STATE
+android.permission.FAKE_PACKAGE_SIGNATURE
+android.permission.INTERNET
+android.permission.RECEIVE_BOOT_COMPLETED
+android.permission.UPDATE_APP_OPS_STATS
+android.permission.WRITE_SECURE_SETTINGS

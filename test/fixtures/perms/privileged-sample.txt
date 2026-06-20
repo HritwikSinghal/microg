@@ -1,0 +1,11 @@
+# Fixture: a tiny PRIVILEGED-permissions list (stand-in for a parsed AOSP set).
+# Hand-written. Note FAKE_PACKAGE_SIGNATURE is intentionally ABSENT here -- it is
+# microG-custom and never appears in the stock platform privileged set, yet the
+# generator must still grant it. INTERNET / RECEIVE_BOOT_COMPLETED are absent
+# because they are not privileged perms, so the intersection must drop them.
+android.permission.ACCESS_COARSE_LOCATION
+android.permission.ACCESS_FINE_LOCATION
+android.permission.ACCESS_NETWORK_STATE
+android.permission.UPDATE_APP_OPS_STATS
+android.permission.WRITE_SECURE_SETTINGS
+android.permission.MODIFY_PHONE_STATE
