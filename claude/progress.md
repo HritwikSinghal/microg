@@ -1,6 +1,12 @@
 # microG Universal Installer -- Progress
 
-Last updated: 2026-06-20 | Session: 2
+Last updated: 2026-06-20 | Session: 4
+
+## Phase 1 Handoff
+
+A fresh-context brief for the next agent (grounded in actual repo state, with the
+exact contracts for components.conf, detect.sh, log.sh, and on-device placement)
+lives at `claude/phase1-handoff.md`. Start there before Phase 1.
 
 ## Overview
 
@@ -33,7 +39,8 @@ Key principles:
          levels; injectable requested-list for host tests; xmllint validation; XXE-hardened parser;
          dump-requested subcommand (single requested-perms source for genperms + invariant)
 - [x] common/detect.sh (api, arch, root manager, mount engine, partition) + host BATS harness
-      -- pure read-only probes; GETPROP/DETECT_ROOT/DETECT_MOUNTS indirection for mocking; 28 BATS tests
+      -- pure read-only probes; GETPROP/DETECT_ROOT/DETECT_MOUNTS indirection for mocking; 19 BATS tests
+         (+ 9 BATS tests for log.sh = 28 shell tests total)
 - [x] common/log.sh structured logging
       -- selfcheck.log (MICROG_LOG_DIR overridable); mirrors ui_print/stderr; degrades quietly
 - [x] build.sh (hermetic): orchestrate fetch+genperms, assemble ZIP, emit slim components.conf from manifest
@@ -48,18 +55,44 @@ Key principles:
       -- .github/workflows/build.yml (checks -> build -> release-on-v*) + bump.yml (dispatch/weekly -> PR)
 
 ### Phase 1 -- Module-only installer (Magisk + KSU + APatch)
-- [ ] customize.sh manifest interpreter
-- [ ] common/place.sh ModuleOverlayPlacer
-- [ ] common/perms.sh XML selection by API level + placement in matching partition
-- [ ] common/cleanup.sh StockGmsRemover via declarative REPLACE sentinel
-- [ ] post-fs-data.sh (engine-aware removal) + service.sh (boot-gated self-check log)
-- [ ] selfcheck.log diagnostics
-- [ ] shellcheck clean across all scripts
+- [x] customize.sh manifest interpreter
+      -- thin data-driven interpreter over components.conf; per-row failure isolation
+         (one bad component does not abort install); fatal only on missing
+         MODPATH/components.conf/library. 20 BATS tests against stub modules.
+- [x] common/place.sh ModuleOverlayPlacer
+      -- place_resolve_partition / place_app / place_framework / place_remove;
+         whole-word partition match + warn-fallback; rm-then-copy idempotence
+         (replace never merge); single _place_overlay_root seam for Phase 3
+         DirectPartitionPlacer. 13 BATS tests.
+- [x] common/perms.sh XML selection by API level + placement in matching partition
+      -- perms_select (prefers perms/<base>-<API>.xml, falls back to base);
+         perms_validate (xmllint when present, warn-once+accept when absent);
+         perms_place_app/framework -> etc/permissions, perms_place_sysconfig ->
+         etc/sysconfig. Never generates XML on device. 20 BATS tests.
+- [x] common/cleanup.sh StockGmsRemover via declarative REPLACE sentinel
+      -- cleanup_stock_gms PART ENGINE drops .replace sentinels over a declarative
+         stock-dir list under priv-app + app; portable across magic-mount/overlayfs;
+         idempotent. 16 BATS tests (shared with boot scripts).
+- [x] post-fs-data.sh (engine-aware removal) + service.sh (boot-gated self-check log)
+      -- post-fs-data: early-boot REPLACE re-lay, FBE-safe (no /data/data);
+         service.sh: bounded boot-gate loop ($GETPROP seam + SVC_BOOT_* knobs),
+         self-check summary to selfcheck.log only.
+- [x] selfcheck.log diagnostics
+      -- service.sh writes detected env + overlay package presence + OK/PROBLEM verdict.
+- [x] shellcheck clean across all scripts
+      -- all 10 scripts in the CI list pass; new scripts added to build.yml shellcheck step.
 
 ### Phase 2 -- Phonesky variant + MapsV1 framework path
-- [ ] Phonesky vs FakeStore mutual-exclusion (atomic across place+perms+cleanup)
-- [ ] type=framework handling (JAR -> framework dir + permissions XML)
-- [ ] Resolve Phonesky sourcing/mirror question
+- [x] Phonesky vs FakeStore mutual-exclusion (atomic across place+perms+cleanup)
+      -- customize.sh _purge_conflicts splits the conflicts column and calls
+         place_remove + deletes the conflicting perms XML before placing; clean
+         variant switch on re-flash.
+- [x] type=framework handling (JAR -> framework dir + permissions XML)
+      -- place_framework -> system/<part>/framework/<basename>; perms_place_framework
+         -> etc/permissions; customize dispatches on the type column.
+- [x] Resolve Phonesky sourcing/mirror question
+      -- decision: user-supplied APK (no Google binary shipped); doc at
+         docs/phonesky-sourcing.md. manifest.toml Phonesky stays deferred.
 
 ### Phase 3 -- System-mode / direct-partition placement
 - [ ] DirectPartitionPlacer (mount rw, 0644, SELinux contexts)
@@ -81,8 +114,8 @@ Key principles:
 | Phase | Status | Tasks done |
 |-------|--------|------------|
 | Phase 0 -- Foundations + CI invariant | Code-complete* | 11/11 |
-| Phase 1 -- Module-only installer | Pending | 0/7 |
-| Phase 2 -- Phonesky + MapsV1 | Pending | 0/3 |
+| Phase 1 -- Module-only installer | Code-complete* | 7/7 |
+| Phase 2 -- Phonesky + MapsV1 | Code-complete* | 3/3 |
 | Phase 3 -- System-mode placement | Pending | 0/3 |
 | Phase 4 -- Recovery flashing | Pending | 0/2 |
 | Phase 5 -- Spoofing guide | Pending | 0/4 |
@@ -121,3 +154,24 @@ the `checks` job (shellcheck/pytest/BATS) should be green. Run the `bump` workfl
   workflows: build.yml (hermetic build + checks + publish Release on tag v*) and
   bump.yml (the only network step; opens a manifest-bump PR; weekly + on demand).
   Publish target = GitHub Releases. APKs never committed; build red until first bump.
+- 2026-06-20 (Session 4): Phase 1 + Phase 2 implemented together via 5 parallel
+  subagents, split by MODULE (disjoint files) not by phase -- the two phases edit
+  the same files, so each phase-2 concern was folded into the module it belongs to
+  (framework path into place.sh/perms.sh, FakeStore<->Phonesky mutual exclusion into
+  customize.sh). Inter-module function contracts were fixed up front in
+  claude/phase1-2-contracts.md so the interpreter could be written in parallel
+  against stubs. Result: 96 BATS tests green (28 prior + 68 new: place 13, perms 20,
+  cleanup 16, customize 20 -- minus 1 reconciliation), shellcheck clean on all 10
+  scripts. Phonesky sourcing resolved as user-supplied (docs/phonesky-sourcing.md).
+  KNOWN FOLLOW-UP (Phase 3): place_remove clears a framework jar named <Name>.jar but
+  place_framework writes <basename of asset> (e.g. maps.jar) -- harmless now (only
+  app-type conflicts are declared) but reconcile when a framework conflict exists.
+  Note: the `build` CI job stays neutral-skip/red until tools/bump fills real APK
+  hashes (PENDING-BUMP); a publishable Release tag requires a bump first.
+- 2026-06-20 (Session 3): Mapped actual repo state via 3 parallel explorers and
+  wrote a fresh-context Phase 1 handoff (`claude/phase1-handoff.md`) with the exact
+  contracts (components.conf 7-column format, detect.sh/log.sh APIs, Magisk env,
+  on-device placement layout). Corrected the test count in this log: shell suite is
+  19 (detect.bats) + 9 (log.bats) = 28 BATS, plus 31 pytest (genperms_test.py) = 59
+  host tests total. Confirmed common/place.sh|perms.sh|cleanup.sh and root
+  post-fs-data.sh|service.sh do NOT exist yet -- they are Phase 1 deliverables.
