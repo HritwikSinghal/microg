@@ -1,6 +1,6 @@
 # microG Universal Installer -- Progress
 
-Last updated: 2026-06-20 | Session: 4
+Last updated: 2026-06-21 | Session: 5
 
 ## Phase 1 Handoff
 
@@ -109,22 +109,30 @@ Key principles:
 - [ ] Native Zygisk spoofing options survey
 - [ ] Verification + pitfalls (no GMS coexistence, activation, DenyList/Shamiko)
 
+## Release Milestones
+
+- **v0.1.0** -- cut on 2026-06-21 (Phases 0-2, working flashable module), then the
+  tag and GitHub Release were removed during a history cleanup (the whole commit
+  history was squashed into logical commits, which invalidated the tag). The code is
+  unchanged and release-ready; re-tag from the rewritten history when ready to
+  publish. Release assets were: microg-installer-v0.1.0.zip (flashable module),
+  update.json (in-app auto-update feed), changelog.md (generated from git log).
+
 ## Status Summary
 
 | Phase | Status | Tasks done |
 |-------|--------|------------|
-| Phase 0 -- Foundations + CI invariant | Code-complete* | 11/11 |
-| Phase 1 -- Module-only installer | Code-complete* | 7/7 |
-| Phase 2 -- Phonesky + MapsV1 | Code-complete* | 3/3 |
+| Phase 0 -- Foundations + CI invariant | Code-complete, build green | 11/11 |
+| Phase 1 -- Module-only installer | Code-complete, build green | 7/7 |
+| Phase 2 -- Phonesky + MapsV1 | Code-complete, build green | 3/3 |
 | Phase 3 -- System-mode placement | Pending | 0/3 |
 | Phase 4 -- Recovery flashing | Pending | 0/2 |
 | Phase 5 -- Spoofing guide | Pending | 0/4 |
 
-\* Code-complete = all files written; host/CI verification is the user's to run
-(per directive: agent does not build/test/flash). The `build` CI job is RED until
-the first `tools/bump` fills real APK hashes (sha256 is "PENDING-BUMP" by design);
-the `checks` job (shellcheck/pytest/BATS) should be green. Run the `bump` workflow
-(or `tools/bump` locally) to produce real pins, then the build can publish.
+Phases 0-2 are code-complete and verified by a real (green) build: `tools/bump`
+filled real F-Droid APK hashes (PR #1), so the `build` CI job passes and can
+publish. The PENDING-BUMP era is over. Verification of on-device behaviour remains
+the user's to run (per directive: agent does not build/test/flash).
 
 ## Decisions & Notes
 
@@ -168,6 +176,20 @@ the `checks` job (shellcheck/pytest/BATS) should be green. Run the `bump` workfl
   app-type conflicts are declared) but reconcile when a framework conflict exists.
   Note: the `build` CI job stays neutral-skip/red until tools/bump fills real APK
   hashes (PENDING-BUMP); a publishable Release tag requires a bump first.
+- 2026-06-21 (Session 5): Cut v0.1.0. Squash-merged PR #1 (dc911f9) so the real
+  F-Droid hashes landed as one clean commit; confirmed a real (non-PENDING) build on
+  master, which surfaced + fixed a latent Phase 0 bug (build.sh passed --manifest
+  AFTER the subcommand, but manifest.py defines it as a global option -- masked until
+  now because the build had always neutral-skipped on PENDING-BUMP; fixed c06b547).
+  Tagged v0.1.0 -> build + release jobs green -> Release published. Documented the
+  whole flow in docs/RELEASING.md. THEN, same session, cleaned up git history: the
+  whole 27-commit history was squashed (by contiguous range, content-preserving) into
+  5 logical commits (scaffold/design -> Phase 0 build system -> Phase 1/2 installer ->
+  auto-update feed -> release pins/MapsV1/runbook) and force-pushed to master; the
+  v0.1.0 tag and GitHub Release were deleted (squash invalidated the tag). Re-tag from
+  the new history to re-publish. Loose ends: marketplace actions warn "Node.js 20
+  deprecated" (cosmetic; future @v4 bump); FakeStore-vs-Play-Store hybrid store
+  selector (auto-detect + MICROG_STORE flag) still deferred.
 - 2026-06-20 (Session 3): Mapped actual repo state via 3 parallel explorers and
   wrote a fresh-context Phase 1 handoff (`claude/phase1-handoff.md`) with the exact
   contracts (components.conf 7-column format, detect.sh/log.sh APIs, Magisk env,

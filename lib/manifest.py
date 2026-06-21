@@ -48,7 +48,7 @@ class Apk:
     type: str  # "app" | "framework"
     partition: str
     version_code: int
-    source: str  # "github" | "fdroid"
+    source: str  # "github" | "fdroid" | "vendored"
     url: str
     sha256: str
     signer_cert_sha256: str
@@ -91,7 +91,9 @@ class ManifestError(Exception):
 
 
 _VALID_TYPES: Final[frozenset[str]] = frozenset({"app", "framework"})
-_VALID_SOURCES: Final[frozenset[str]] = frozenset({"github", "fdroid"})
+# "vendored" -- the artifact is committed in-repo (url is a repo-relative path),
+# not downloaded. Used for MapsV1, which has no stable bare-jar download URL.
+_VALID_SOURCES: Final[frozenset[str]] = frozenset({"github", "fdroid", "vendored"})
 _REQUIRED_STR_FIELDS: Final[tuple[str, ...]] = (
     "name",
     "package",

@@ -22,51 +22,51 @@ schema_version = 1
 
 # microG Services Core -- mandatory core component.
 # Standard build (not -hw / -user). v0.3.15.x, versionCode 250932030.
-# GmsCore release-asset URL pattern:
-#   github.com/microg/GmsCore/releases/download/v<ver>/com.google.android.gms-<versionCode>.apk
-# TODO(bump): confirm the exact release tag. The tag below follows the observed
-# microG convention (v<semver>) but could not be verified offline; tools/bump
-# resolves the real latest tag + asset and overwrites this url.
+# Sourced from the microG F-Droid repo (index-v2.json), keyed by package -- the
+# canonical microG-signed distribution and the same source MinMicroG uses.
+# tools/bump resolves the latest version + sha256 from the index and rewrites url.
 [[apk]]
 name               = "GmsCore"
 package            = "com.google.android.gms"
 type               = "app"
 partition          = "product"
 version_code       = 250932030
-source             = "github"
-url                = "https://github.com/microg/GmsCore/releases/download/v0.3.15.0/com.google.android.gms-250932030.apk"
-sha256             = "PENDING-BUMP"
+source             = "fdroid"
+url                = "https://microg.org/fdroid/repo/com.google.android.gms-250932030.apk"
+sha256             = "52597e77fd25fdd347574d0457ed1936a4b9561cf4c8d34e7ac8dd8191dfd4b9"
 signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
 conflicts          = []
 
-# GsfProxy -- legacy Google Services Framework shim. microG-signed.
-# Shipped from the same microG GmsCore repo's release assets (and mirrored on
-# F-Droid). source=github keeps it on the same trust root as GmsCore.
-# TODO(bump): confirm the GsfProxy asset name / versionCode; resolved by tools/bump.
+# GsfProxy -- legacy Google Services Framework shim (com.google.android.gsf).
+# Required for GCM/C2DM push and apps hardcoded to the GSF package; microG keeps
+# it a SEPARATE package from GmsCore by design (it must own the gsf namespace).
+# microG-signed; sourced from the microG F-Droid repo, which resolves cleanly by
+# package (the GitHub release asset is just "GsfProxy.apk", which bump can't match).
 [[apk]]
 name               = "GsfProxy"
 package            = "com.google.android.gsf"
 type               = "app"
 partition          = "product"
-version_code       = 0
-source             = "github"
-url                = "https://github.com/microg/GmsCore/releases/download/v0.3.15.0/com.google.android.gsf-9.apk"
-sha256             = "PENDING-BUMP"
+version_code       = 8
+source             = "fdroid"
+url                = "https://microg.org/fdroid/repo/com.google.android.gsf-8.apk"
+sha256             = "86891b174301f06a1c84187b545a0a2a57044c6b768f3e84e865908743349692"
 signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
 conflicts          = []
 
 # FakeStore (microG Companion) -- default store stub. microG-signed.
 # Mutually exclusive with Phonesky (same package com.android.vending).
-# TODO(bump): confirm the FakeStore / Companion asset name + versionCode.
+# Sourced from the microG F-Droid repo (the Companion ships there; same source
+# as MinMicroG). tools/bump resolves the latest version + sha256 from the index.
 [[apk]]
 name               = "FakeStore"
 package            = "com.android.vending"
 type               = "app"
 partition          = "product"
-version_code       = 0
-source             = "github"
-url                = "https://github.com/microg/FakeStore/releases/download/v0.1.0/com.android.vending-7.apk"
-sha256             = "PENDING-BUMP"
+version_code       = 84022630
+source             = "fdroid"
+url                = "https://microg.org/fdroid/repo/com.android.vending-84022630.apk"
+sha256             = "a973e0235a2829773a4faf36d235d5f703d1c04a2adff674ebaa535a2e78f937"
 signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
 conflicts          = ["Phonesky"]
 
@@ -74,18 +74,21 @@ conflicts          = ["Phonesky"]
 # type = "framework": the asset is maps.jar and goes to <part>/framework plus a
 # permissions XML. fetch verifies sha256 ONLY (a JAR is not apksigner-verifiable),
 # so signer_cert_sha256 is a documented placeholder.
-# TODO(bump): MapsV1 has no GitHub/F-Droid release; it is typically vendored from
-# a known-good source. tools/bump cannot resolve it automatically -- pin the url +
-# sha256 by hand and leave version_code as the convention 1.
+# source = "vendored": there is no stable bare-jar download URL (microG's
+# android_frameworks_mapsv1 ships only a flashable zip), so -- following the
+# working micro5k/microg-unofficial-installer reference -- the jar is committed
+# in-repo at the url path below and the build copies + sha256-verifies it.
+# This is the ONE committed binary: a tiny (143 KB), immutable, FLOSS framework
+# lib. tools/bump skips it (framework). version_code 9 matches micro5k.
 [[apk]]
 name               = "MapsV1"
 package            = "com.google.android.maps"
 type               = "framework"
 partition          = "product"
-version_code       = 1
-source             = "github"
-url                = "https://github.com/microg/android_packages_apps_GmsCore/raw/master/maps-api-v1/maps.jar"
-sha256             = "PENDING-BUMP"
+version_code       = 9
+source             = "vendored"
+url                = "vendor/com.google.android.maps.jar"
+sha256             = "a3e12a952183473de8f1725d3b01f784f01d35c33f6741bd8875fbdb91ebadae"
 signer_cert_sha256 = "n-a-framework-jar"
 conflicts          = []
 
