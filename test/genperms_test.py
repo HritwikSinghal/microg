@@ -21,6 +21,8 @@ Run:  python3 -m pytest test/genperms_test.py -v
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -36,6 +38,28 @@ import genperms  # noqa: E402
 import invariant  # noqa: E402
 
 FAKE = genperms.FAKE_PACKAGE_SIGNATURE
+
+
+def _load_bump_module():
+    """Import tools/bump (a shebang script with no .py extension) as a module.
+
+    importlib.util lets us load it by explicit path so the bump tests can call
+    its functions directly, hermetically, with no network and no subprocess.
+    """
+    bump_path = REPO_ROOT / "tools" / "bump"
+    # bump has no .py extension, so spec_from_file_location can't infer a loader;
+    # hand it a SourceFileLoader explicitly.
+    loader = importlib.machinery.SourceFileLoader("bump_tool", str(bump_path))
+    spec = importlib.util.spec_from_loader("bump_tool", loader)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec: @dataclass resolves cls.__module__ via sys.modules.
+    sys.modules["bump_tool"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+bump = _load_bump_module()
 
 
 class IntersectionTests(unittest.TestCase):
@@ -458,6 +482,228 @@ class CliIntegrationTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(rc, 1)
+
+
+class SignerNormalizationTests(unittest.TestCase):
+    """_norm_cert: the SINGLE canonicalizer shared by the gate and tools/bump."""
+
+    def test_colon_and_case_reformat_is_equivalent(self) -> None:
+        # A cosmetic reformat of an UNCHANGED hex cert must canonicalize equal.
+        colon = "9B:D0:67:27:E6:27:96:C0"
+        plain = "9bd06727e62796c0"
+        self.assertEqual(invariant._norm_cert(colon), invariant._norm_cert(plain))
+
+    def test_placeholders_compare_verbatim(self) -> None:
+        # Non-hex sentinels are not normalized away; distinct ones stay distinct.
+        self.assertEqual(
+            invariant._norm_cert("n-a-framework-jar"), "n-a-framework-jar"
+        )
+        self.assertNotEqual(
+            invariant._norm_cert("TODO-phase2"),
+            invariant._norm_cert("n-a-framework-jar"),
+        )
+
+    def test_gate_does_not_fire_on_cosmetic_reformat(self) -> None:
+        # Same cert, one colon-grouped + uppercased -> gate must PASS.
+        old = {"apk": [{"name": "X", "signer_cert_sha256": "9B:D0:67:27"}]}
+        new = {"apk": [{"name": "X", "signer_cert_sha256": "9bd06727"}]}
+        result = invariant.signer_cert_gate(old, new)
+        self.assertTrue(result.ok, result.report())
+
+    def test_gate_fires_on_genuine_cert_change(self) -> None:
+        old = {"apk": [{"name": "X", "signer_cert_sha256": "9bd06727"}]}
+        new = {"apk": [{"name": "X", "signer_cert_sha256": "deadbeef"}]}
+        result = invariant.signer_cert_gate(old, new)
+        self.assertFalse(result.ok)
+        self.assertIn("SECURITY EVENT", result.report())
+
+    def test_bump_and_invariant_share_one_canonicalizer(self) -> None:
+        # The whole point of the fix: bump must reuse the gate's _norm_cert, not
+        # a divergent local copy. Verify it is literally the same function.
+        self.assertIs(bump._norm_cert, invariant._norm_cert)
+
+
+class BumpApplyResultsTests(unittest.TestCase):
+    """apply_results: a missing key line must be fatal (no stale-anchor write)."""
+
+    _MANIFEST = (
+        "schema_version = 1\n\n"
+        "[[apk]]\n"
+        'name               = "GmsCore"\n'
+        'package            = "com.google.android.gms"\n'
+        'type               = "app"\n'
+        'source             = "github"\n'
+        "version_code       = 1\n"
+        'url                = "https://example/old.apk"\n'
+        'sha256             = "old"\n'
+        'signer_cert_sha256 = "abc"\n'
+    )
+
+    def test_missing_sha256_key_raises_and_does_not_write(self) -> None:
+        # Drop the sha256 line: _set_field returns False, which must now be fatal
+        # so we never write a new url+version_code beside a stale/absent sha256.
+        manifest_text = self._MANIFEST.replace('sha256             = "old"\n', "")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.toml"
+            path.write_text(manifest_text, "utf-8")
+            result = bump.BumpResult(
+                name="GmsCore", version_code=2, url="https://example/new.apk",
+                sha256="newhash",
+            )
+            with self.assertRaises(bump.BumpError) as ctx:
+                bump.apply_results(path, [result], dry_run=False)
+            self.assertIn("sha256", str(ctx.exception))
+            # The file must be byte-for-byte unchanged (atomic swap never ran).
+            self.assertEqual(path.read_text("utf-8"), manifest_text)
+
+    def test_all_keys_present_writes_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.toml"
+            path.write_text(self._MANIFEST, "utf-8")
+            result = bump.BumpResult(
+                name="GmsCore", version_code=2, url="https://example/new.apk",
+                sha256="newhash",
+            )
+            bump.apply_results(path, [result], dry_run=False)
+            written = path.read_text("utf-8")
+            self.assertIn("version_code       = 2", written)
+            self.assertIn('"https://example/new.apk"', written)
+            self.assertIn('"newhash"', written)
+            # No temp file left behind in the directory.
+            leftovers = [p.name for p in Path(tmp).iterdir() if p.name != "manifest.toml"]
+            self.assertEqual(leftovers, [])
+
+
+class BumpDowngradeGuardTests(unittest.TestCase):
+    """bump_component: refuse a lower versionCode unless --allow-downgrade."""
+
+    def _component(self, committed_vc: int) -> object:
+        return bump.Component(
+            name="GmsCore",
+            package="com.google.android.gms",
+            type="app",
+            source="github",
+            url="https://example/gms.apk",
+            sha256="old",
+            signer_cert_sha256="abc",
+            version_code=committed_vc,
+        )
+
+    def _patch(self, resolved_vc: int) -> list:
+        """Stub out network/subprocess so the guard logic runs hermetically.
+
+        Returns the list of (attr, original) to restore.
+        """
+        saved = []
+        for attr, stub in (
+            ("_resolve", lambda c: bump.ResolvedArtifact(url=c.url, version_code_hint=resolved_vc)),
+            ("_download", lambda url, dest: None),
+            ("_sha256_file", lambda p: "newhash"),
+            ("_read_version_code", lambda apk, hint: resolved_vc),
+            # signer cert matches committed -> gate passes, downgrade logic runs.
+            ("_read_signer_cert_sha256", lambda apk: "abc"),
+        ):
+            saved.append((attr, getattr(bump, attr)))
+            setattr(bump, attr, stub)
+        return saved
+
+    def _restore(self, saved: list) -> None:
+        for attr, original in saved:
+            setattr(bump, attr, original)
+
+    def test_downgrade_refused_by_default(self) -> None:
+        saved = self._patch(resolved_vc=5)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(bump.BumpError) as ctx:
+                    bump.bump_component(self._component(10), Path(tmp))
+                self.assertIn("DOWNGRADE", str(ctx.exception))
+        finally:
+            self._restore(saved)
+
+    def test_downgrade_allowed_with_flag(self) -> None:
+        saved = self._patch(resolved_vc=5)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = bump.bump_component(
+                    self._component(10), Path(tmp), allow_downgrade=True
+                )
+                self.assertEqual(res.version_code, 5)
+        finally:
+            self._restore(saved)
+
+    def test_same_version_is_accepted(self) -> None:
+        saved = self._patch(resolved_vc=10)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = bump.bump_component(self._component(10), Path(tmp))
+                self.assertEqual(res.version_code, 10)
+        finally:
+            self._restore(saved)
+
+    def test_upgrade_is_accepted(self) -> None:
+        saved = self._patch(resolved_vc=11)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = bump.bump_component(self._component(10), Path(tmp))
+                self.assertEqual(res.version_code, 11)
+        finally:
+            self._restore(saved)
+
+
+class BumpLoadComponentsTests(unittest.TestCase):
+    """load_components: duplicate-name detection + clear field validation."""
+
+    _BASE = (
+        "schema_version = 1\n\n"
+        "[[apk]]\n"
+        'name = "GmsCore"\n'
+        'package = "com.google.android.gms"\n'
+        'type = "app"\n'
+        'source = "github"\n'
+        "version_code = 1\n"
+        'url = "https://example/a.apk"\n'
+        'sha256 = "a"\n'
+        'signer_cert_sha256 = "abc"\n'
+    )
+
+    def _write(self, text: str) -> Path:
+        tmp = tempfile.mkdtemp()
+        path = Path(tmp) / "manifest.toml"
+        path.write_text(text, "utf-8")
+        return path
+
+    def test_duplicate_name_raises(self) -> None:
+        dup = self._BASE + (
+            "\n[[apk]]\n"
+            'name = "GmsCore"\n'  # same name again
+            'package = "com.other"\n'
+            'type = "app"\n'
+            'source = "fdroid"\n'
+            "version_code = 1\n"
+            'url = "https://example/b.apk"\n'
+            'sha256 = "b"\n'
+            'signer_cert_sha256 = "def"\n'
+        )
+        with self.assertRaises(bump.BumpError) as ctx:
+            bump.load_components(self._write(dup))
+        self.assertIn("duplicate", str(ctx.exception).lower())
+
+    def test_missing_required_field_raises_bumperror(self) -> None:
+        # Drop sha256 -> a bare KeyError must NOT escape; a BumpError must.
+        bad = self._BASE.replace('sha256 = "a"\n', "")
+        with self.assertRaises(bump.BumpError):
+            bump.load_components(self._write(bad))
+
+    def test_non_int_version_code_raises_bumperror(self) -> None:
+        bad = self._BASE.replace("version_code = 1\n", 'version_code = "oops"\n')
+        with self.assertRaises(bump.BumpError):
+            bump.load_components(self._write(bad))
+
+    def test_valid_manifest_loads(self) -> None:
+        comps = bump.load_components(self._write(self._BASE))
+        self.assertEqual(len(comps), 1)
+        self.assertEqual(comps[0].name, "GmsCore")
 
 
 if __name__ == "__main__":

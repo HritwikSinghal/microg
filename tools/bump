@@ -3,8 +3,9 @@
 
 For each non-deferred component, bump:
   1. resolves the latest release artifact
-       source=github -> GitHub releases API (latest non-draft release; pick the
-                        asset matching the component's package),
+       source=github -> GitHub /releases/latest (most recent published release
+                        that is not a draft and not a prerelease; pick the asset
+                        matching the component's package),
        source=fdroid -> F-Droid index-v2.json (latest version for the package),
   2. downloads that artifact to a temp dir,
   3. reads its versionCode (via aapt2 / apkanalyzer if available, else inferred
@@ -40,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -51,6 +53,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+
+# Reuse the SINGLE signer-cert canonicalizer that the CI gate (lib/invariant.py)
+# uses, so the two enforcers can never disagree on cert equality (design spec
+# 6.2). tools/bump lives in tools/; lib/ is its sibling under the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from invariant import _norm_cert  # noqa: E402
 
 PENDING_BUMP: Final[str] = "PENDING-BUMP"
 SCHEMA_VERSION_SUPPORTED: Final[int] = 1
@@ -103,6 +111,57 @@ class Component:
 # --------------------------------------------------------------------------- #
 
 
+# Required string fields on every [[apk]] (url may be empty -- deferred marker).
+_REQUIRED_STR_FIELDS: Final[tuple[str, ...]] = (
+    "name",
+    "package",
+    "type",
+    "source",
+    "sha256",
+    "signer_cert_sha256",
+)
+
+
+def _coerce_component(raw: dict[str, object], index: int) -> Component:
+    """Validate one raw [[apk]] table into a Component with clear errors.
+
+    Mirrors manifest.py's _coerce_apk: required strings must be present and
+    non-empty, version_code must be a real int (not bool). Surfacing these as
+    BumpError keeps a malformed manifest from raising a bare KeyError/ValueError
+    that would escape bump's error handling (the manifest is hand-edited).
+    """
+    where = f"[[apk]] #{index} (name={raw.get('name', '?')!r})"
+
+    for field in _REQUIRED_STR_FIELDS:
+        value = raw.get(field)
+        if not isinstance(value, str) or value == "":
+            raise BumpError(
+                f"{where}: field {field!r} must be a non-empty string, got {value!r}"
+            )
+
+    url = raw.get("url", "")
+    if not isinstance(url, str):
+        raise BumpError(f"{where}: url must be a string, got {url!r}")
+
+    version_code = raw.get("version_code")
+    # bool is an int subclass -- reject it so True/False can't masquerade as 0/1.
+    if not isinstance(version_code, int) or isinstance(version_code, bool):
+        raise BumpError(
+            f"{where}: version_code must be an integer, got {version_code!r}"
+        )
+
+    return Component(
+        name=str(raw["name"]),
+        package=str(raw["package"]),
+        type=str(raw["type"]),
+        source=str(raw["source"]),
+        url=url,
+        sha256=str(raw["sha256"]),
+        signer_cert_sha256=str(raw["signer_cert_sha256"]),
+        version_code=version_code,
+    )
+
+
 def load_components(path: Path) -> list[Component]:
     try:
         with path.open("rb") as handle:
@@ -121,20 +180,16 @@ def load_components(path: Path) -> list[Component]:
     if not isinstance(raw_apks, list) or not raw_apks:
         raise BumpError("manifest has no [[apk]] entries")
 
-    components: list[Component] = []
-    for raw in raw_apks:
-        components.append(
-            Component(
-                name=str(raw["name"]),
-                package=str(raw["package"]),
-                type=str(raw["type"]),
-                source=str(raw["source"]),
-                url=str(raw.get("url", "")),
-                sha256=str(raw["sha256"]),
-                signer_cert_sha256=str(raw["signer_cert_sha256"]),
-                version_code=int(raw["version_code"]),
-            )
-        )
+    components = [_coerce_component(raw, i) for i, raw in enumerate(raw_apks)]
+
+    # Duplicate component names would let apply_results' dict(_find_blocks(...))
+    # silently collapse blocks and update the wrong one. Reject them up front,
+    # matching manifest.py's own duplicate guard.
+    names = [c.name for c in components]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise BumpError(f"duplicate component name(s): {duplicates}")
+
     return components
 
 
@@ -208,9 +263,20 @@ class ResolvedArtifact:
 
 
 def _resolve_github(component: Component) -> ResolvedArtifact:
+    """Resolve the latest release artifact via GitHub's /releases/latest.
+
+    /releases/latest returns the most recent published release that is NOT a
+    draft and NOT a prerelease (GitHub's documented semantics). We deliberately
+    skip prereleases by default: a privileged-app install path should track
+    stable releases only. The chosen tag is logged for traceability.
+    """
     owner, repo = _github_owner_repo(component)
     api = f"{GITHUB_API}/repos/{owner}/{repo}/releases/latest"
     release = _http_get_json(api)
+
+    tag = release.get("tag_name")
+    if isinstance(tag, str) and tag:
+        print(f"[{component.name}] GitHub release tag: {tag}", file=sys.stderr)
 
     assets = release.get("assets")
     if not isinstance(assets, list) or not assets:
@@ -283,7 +349,11 @@ def _resolve_fdroid(component: Component) -> ResolvedArtifact:
     if not isinstance(versions, dict) or not versions:
         raise BumpError(f"{component.name}: no versions in F-Droid index")
 
-    best_vc = -1
+    # Pick by (versionCode, added) so ties are broken deterministically: highest
+    # versionCode wins; on equal versionCode prefer the most recently `added`
+    # build; if `added` is also equal, fall back to the lexicographically
+    # greatest file name -- a stable key independent of dict iteration order.
+    best_key: tuple[int, int, str] | None = None
     best_file_name: str | None = None
     for ver in versions.values():
         if not isinstance(ver, dict):
@@ -292,15 +362,21 @@ def _resolve_fdroid(component: Component) -> ResolvedArtifact:
         file_obj = ver.get("file", {})
         vc = manifest.get("versionCode") if isinstance(manifest, dict) else None
         name = file_obj.get("name") if isinstance(file_obj, dict) else None
-        if isinstance(vc, int) and isinstance(name, str) and vc > best_vc:
-            best_vc = vc
+        if not (isinstance(vc, int) and isinstance(name, str)):
+            continue
+        added = ver.get("added")
+        added_key = added if isinstance(added, int) else -1
+        key = (vc, added_key, name)
+        if best_key is None or key > best_key:
+            best_key = key
             best_file_name = name
 
-    if best_file_name is None:
+    if best_key is None or best_file_name is None:
         raise BumpError(f"{component.name}: could not find a usable F-Droid version")
 
-    # file.name is repo-relative and starts with '/'.
-    url = FDROID_REPO_BASE + best_file_name
+    best_vc = best_key[0]
+    # file.name is repo-relative; join robustly regardless of leading-slash quirks.
+    url = FDROID_REPO_BASE.rstrip("/") + "/" + best_file_name.lstrip("/")
     hint = best_vc if best_vc >= 0 else _version_code_from_name(best_file_name)
     return ResolvedArtifact(url=url, version_code_hint=hint)
 
@@ -339,21 +415,36 @@ def _run(cmd: list[str]) -> str:
 def _read_version_code(apk: Path, hint: int | None) -> int:
     """Read versionCode from the APK; fall back to the tag/filename hint.
 
-    Prefers apkanalyzer, then aapt2. If neither is available, uses the hint
-    parsed from the asset name -- which for microG follows <pkg>-<versionCode>.apk.
+    Prefers apkanalyzer, then aapt2. If a tool is present but ERRORS (e.g. a
+    corrupt APK or an incompatible tool version), we do not abort -- we fall
+    through to the next source and finally to the filename hint, only raising if
+    EVERY source fails. This keeps one flaky tool from blocking an otherwise
+    resolvable bump.
     """
     if _have("apkanalyzer"):
-        out = _run(["apkanalyzer", "manifest", "version-code", str(apk)])
-        text = out.strip()
-        if text.isdigit():
-            return int(text)
+        try:
+            out = _run(["apkanalyzer", "manifest", "version-code", str(apk)])
+            text = out.strip()
+            if text.isdigit():
+                return int(text)
+        except BumpError as exc:
+            print(
+                f"  note: apkanalyzer failed ({exc}); trying next source",
+                file=sys.stderr,
+            )
 
     if _have("aapt2"):
-        out = _run(["aapt2", "dump", "badging", str(apk)])
-        # line: package: name='...' versionCode='12345' versionName='...'
-        match = re.search(r"versionCode='(\d+)'", out)
-        if match:
-            return int(match.group(1))
+        try:
+            out = _run(["aapt2", "dump", "badging", str(apk)])
+            # line: package: name='...' versionCode='12345' versionName='...'
+            match = re.search(r"versionCode='(\d+)'", out)
+            if match:
+                return int(match.group(1))
+        except BumpError as exc:
+            print(
+                f"  note: aapt2 failed ({exc}); falling back to filename hint",
+                file=sys.stderr,
+            )
 
     if hint is not None:
         print(
@@ -487,10 +578,15 @@ def _resolve(component: Component) -> ResolvedArtifact:
     raise BumpError(f"{component.name}: unknown source {component.source!r}")
 
 
-def bump_component(component: Component, workdir: Path) -> BumpResult:
+def bump_component(
+    component: Component, workdir: Path, allow_downgrade: bool = False
+) -> BumpResult:
     """Resolve, download, inspect one component. Enforces the signer-cert gate.
 
     Raises SignerCertChanged if the new cert differs from the committed one.
+    Refuses a version DOWNGRADE (resolved versionCode < committed) unless
+    allow_downgrade is set: a transient F-Droid/GitHub index regression could
+    otherwise pin a lower versionCode, which on-device PackageManager rejects.
     """
     print(f"[{component.name}] resolving latest from {component.source}...", file=sys.stderr)
     artifact = _resolve(component)
@@ -502,9 +598,35 @@ def bump_component(component: Component, workdir: Path) -> BumpResult:
     sha256 = _sha256_file(apk_path)
     version_code = _read_version_code(apk_path, artifact.version_code_hint)
 
+    # DOWNGRADE GUARD -- never pin a versionCode below the committed one. A lower
+    # code means a stale/regressed upstream index; writing it would produce a ZIP
+    # that PackageManager refuses to install over the already-shipped version.
+    if version_code < component.version_code:
+        if not allow_downgrade:
+            raise BumpError(
+                f"\n"
+                f"  *** VERSION DOWNGRADE refused for {component.name} ***\n"
+                f"  committed versionCode: {component.version_code}\n"
+                f"  resolved versionCode:  {version_code}\n"
+                f"  A lower versionCode usually means a transient upstream index\n"
+                f"  regression; PackageManager rejects downgrades on device. Pass\n"
+                f"  --allow-downgrade only if you have verified this is intentional."
+            )
+        print(
+            f"[{component.name}] WARNING: accepting downgrade "
+            f"{component.version_code} -> {version_code} (--allow-downgrade)",
+            file=sys.stderr,
+        )
+    elif version_code == component.version_code:
+        print(
+            f"[{component.name}] no change: versionCode already {version_code}",
+            file=sys.stderr,
+        )
+
     # SIGNER-CERT GATE -- only applies to type=app (a JAR has no apksigner cert).
-    new_cert = _read_signer_cert_sha256(apk_path)
-    committed = component.signer_cert_sha256.replace(":", "").lower()
+    # Compare via the shared canonicalizer so bump and the CI gate agree exactly.
+    new_cert = _norm_cert(_read_signer_cert_sha256(apk_path))
+    committed = _norm_cert(component.signer_cert_sha256)
     if new_cert != committed:
         raise SignerCertChanged(
             f"\n"
@@ -528,24 +650,66 @@ def bump_component(component: Component, workdir: Path) -> BumpResult:
 def apply_results(
     manifest_path: Path, results: list[BumpResult], dry_run: bool
 ) -> None:
-    """Rewrite version_code / url / sha256 for each result, preserving comments."""
-    lines = manifest_path.read_text(encoding="ascii").splitlines(keepends=True)
+    """Rewrite version_code / url / sha256 for each result, preserving comments.
+
+    TOML is defined as UTF-8, so we read/write UTF-8 (consistent with tomllib).
+    Every field MUST be present in its block: _set_field returns False when the
+    target key line is absent, and a half-applied bump (e.g. new url but a STALE
+    sha256) would desync the integrity anchor from the artifact. So a False
+    return is fatal here -- we name the component and the missing key.
+    """
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # TOML is UTF-8 by definition; a decode failure means the file is corrupt.
+        # Surface it as a BumpError so main()'s handler reports it cleanly.
+        raise BumpError(f"manifest is not valid UTF-8: {exc}") from exc
+    lines = text.splitlines(keepends=True)
     blocks = dict(_find_blocks(lines))
 
     for result in results:
         block = blocks.get(result.name)
         if block is None:
             raise BumpError(f"no [[apk]] block named {result.name!r} to update")
-        _set_field(lines, block, "version_code", str(result.version_code))
-        _set_field(lines, block, "url", _toml_str(result.url))
-        _set_field(lines, block, "sha256", _toml_str(result.sha256))
+        # Order matters only for readability; all three are mandatory. A missing
+        # key means the block is malformed -- refuse rather than write a partial,
+        # internally-inconsistent set of pins.
+        fields: tuple[tuple[str, str], ...] = (
+            ("version_code", str(result.version_code)),
+            ("url", _toml_str(result.url)),
+            ("sha256", _toml_str(result.sha256)),
+        )
+        for key, value in fields:
+            if not _set_field(lines, block, key, value):
+                raise BumpError(
+                    f"{result.name}: cannot update -- key {key!r} not found in its "
+                    f"[[apk]] block; manifest would be left with a stale value"
+                )
 
     new_text = "".join(lines)
     if dry_run:
         print("--- dry-run: manifest would become ---", file=sys.stderr)
         sys.stdout.write(new_text)
         return
-    manifest_path.write_text(new_text, encoding="ascii")
+
+    # Atomic write: render to a temp file in the SAME directory (so os.replace is
+    # a rename within one filesystem, hence atomic), then swap. A crash mid-write
+    # can never leave the single source of truth half-written.
+    manifest_path = manifest_path.resolve()
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{manifest_path.name}.", suffix=".tmp", dir=str(manifest_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(new_text)
+            handle.flush()
+            os.fsync(handle.fileno())  # durability before the rename
+        os.replace(tmp_path, manifest_path)
+    except BaseException:
+        # On any failure, do not leave a stray temp file behind.
+        tmp_path.unlink(missing_ok=True)
+        raise
     print(f"updated {manifest_path}", file=sys.stderr)
 
 
@@ -561,6 +725,14 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run",
         action="store_true",
         help="print the would-be manifest to stdout; do not write",
+    )
+    parser.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help=(
+            "permit a resolved versionCode LOWER than the committed one (refused "
+            "by default; PackageManager rejects downgrades on device)"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -594,7 +766,11 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             try:
-                results.append(bump_component(component, workdir))
+                results.append(
+                    bump_component(
+                        component, workdir, allow_downgrade=args.allow_downgrade
+                    )
+                )
             except SignerCertChanged as exc:
                 # Hard, loud failure -- never proceed past a cert change.
                 print(str(exc), file=sys.stderr)

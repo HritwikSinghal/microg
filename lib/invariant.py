@@ -32,6 +32,7 @@ perms/<name>.xml, and the signer gate operates on parsed TOML dicts.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
@@ -159,6 +160,35 @@ def check_permission_invariant(
 # --------------------------------------------------------------------------- #
 # Gate 2: signer-cert gate.
 # --------------------------------------------------------------------------- #
+# A hex SHA-256 cert is 64 hex chars, optionally colon-grouped (apksigner prints
+# "AA:BB:..."). Anything else (placeholders like "n-a-framework-jar",
+# "TODO-phase2") is NOT a cert and must compare verbatim.
+_HEX_CERT_RE = re.compile(r"^[0-9a-fA-F:]+$")
+
+
+def _norm_cert(value: str) -> str:
+    """Canonicalize a signer-cert SHA-256 for comparison.
+
+    This is the SINGLE source of truth for cert equality, shared by both
+    enforcers (this gate and tools/bump) so they can never disagree -- the
+    security centerpiece must not contradict itself (design spec 6.2).
+
+    WHY two branches: real certs may be written with or without ':' separators
+    and in either case, so a purely cosmetic reformat of an *unchanged* cert must
+    not trip the gate. Placeholders are not hex and must be matched exactly, so a
+    placeholder edit (e.g. "TODO-phase2" -> a real cert) is still flagged.
+
+    - A value that looks like a hex cert (only [0-9a-fA-F:]) is normalized:
+      strip whitespace, drop ':' groupers, lowercase.
+    - Any other value (placeholder/sentinel) is returned stripped but otherwise
+      verbatim, so non-cert values compare exactly.
+    """
+    stripped = value.strip()
+    if _HEX_CERT_RE.match(stripped):
+        return stripped.replace(":", "").lower()
+    return stripped
+
+
 def _index_manifest_by_name(manifest: dict) -> dict[str, dict]:
     """Index a parsed manifest.toml's [[apk]] entries by component name."""
     entries = manifest.get("apk", [])
@@ -177,8 +207,11 @@ def signer_cert_gate(old_manifest: dict, new_manifest: dict) -> CheckResult:
     A signer change on a privileged-app install path is a security event, never
     an auto-bump. Only components present in BOTH manifests are compared: a newly
     added component has no prior cert to diff, and a removed one is irrelevant.
-    Placeholder/non-pinned values ("n-a-framework-jar", "TODO-phase2") are
-    compared verbatim -- if such a placeholder changes that is still a signal.
+    Certs are compared via the shared ``_norm_cert`` canonicalizer (also used by
+    tools/bump) so a cosmetic reformat of an unchanged hex cert does NOT fire the
+    gate. Placeholder/non-pinned values ("n-a-framework-jar", "TODO-phase2") are
+    not hex and so compare verbatim -- if such a placeholder changes that is
+    still a signal.
     """
     result = CheckResult()
     old_idx = _index_manifest_by_name(old_manifest)
@@ -190,7 +223,10 @@ def signer_cert_gate(old_manifest: dict, new_manifest: dict) -> CheckResult:
             continue  # newly added component; nothing to diff against.
         old_cert = old_entry.get("signer_cert_sha256", "")
         new_cert = new_entry.get("signer_cert_sha256", "")
-        if old_cert != new_cert:
+        # Compare canonicalized forms so a cosmetic reformat of an unchanged cert
+        # does not fire the gate, while a genuine key change (or a placeholder
+        # edit) still does. Report the RAW values so the diff stays legible.
+        if _norm_cert(old_cert) != _norm_cert(new_cert):
             result.violations.append(
                 Violation(
                     component=name,
