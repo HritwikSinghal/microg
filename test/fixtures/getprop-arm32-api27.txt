@@ -1,0 +1,6 @@
+# Mocked getprop output: 32-bit ARM device, Android 8.1 (API 27).
+[ro.build.version.sdk]: [27]
+[ro.build.version.release]: [8.1.0]
+[ro.product.cpu.abi]: [armeabi-v7a]
+[ro.product.cpu.abilist]: [armeabi-v7a,armeabi]
+[ro.product.cpu.abilist32]: [armeabi-v7a,armeabi]

@@ -1,0 +1,22 @@
+# Fixture: a "new" manifest.toml for the signer-cert gate test.
+# GmsCore: same versionCode/sha bump is fine -- cert UNCHANGED -> must PASS.
+# FakeStore: signer_cert_sha256 CHANGED -> the gate must FAIL (security event).
+schema_version = 1
+
+[[apk]]
+name               = "GmsCore"
+package            = "com.google.android.gms"
+type               = "app"
+version_code       = 250932031
+url                = "https://example/gms.apk"
+sha256             = "cccc"
+signer_cert_sha256 = "9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165"
+
+[[apk]]
+name               = "FakeStore"
+package            = "com.android.vending"
+type               = "app"
+version_code       = 8
+url                = "https://example/fakestore.apk"
+sha256             = "dddd"
+signer_cert_sha256 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0"

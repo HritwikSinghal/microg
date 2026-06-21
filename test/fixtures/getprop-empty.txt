@@ -1,0 +1,2 @@
+# Mocked getprop output: empty / unknown device. Exercises the
+# missing-property fallbacks (api -> 0, arch -> unknown, is64bit -> false).

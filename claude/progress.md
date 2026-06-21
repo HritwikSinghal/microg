@@ -1,6 +1,6 @@
 # microG Universal Installer -- Progress
 
-Last updated: 2026-06-20 | Session: 1
+Last updated: 2026-06-20 | Session: 2
 
 ## Overview
 
@@ -20,17 +20,32 @@ Key principles:
 ## Plan
 
 ### Phase 0 -- Foundations + CI invariant
-- [ ] Repo scaffold (module.prop, META-INF, dir layout, .gitignore for apks/)
-- [ ] manifest.toml schema + 5 component entries (build-time pins: versionCode, url, apk sha256, signer-cert sha256)
-- [ ] lib/fetch.sh: download + 3-anchor verify (sha256 + apksigner verify + cert match)
-- [ ] lib/genperms: requested(APK) INTERSECT privileged_perms(API) + FAKE_PACKAGE_SIGNATURE; separate sysconfig XML
-- [ ] common/detect.sh (api, arch, root manager, mount engine, partition) + host BATS harness
-- [ ] common/log.sh structured logging
-- [ ] build.sh (hermetic): orchestrate fetch+genperms, assemble ZIP, emit slim components.conf from manifest
-- [ ] bump tool (separate, network-trusting): rewrite manifest.toml from F-Droid/GitHub
-- [ ] CI permission-invariant gate (requested_privileged subset-of allowlist; default-permissions subset-of declared; xmllint)
-- [ ] CI signer-cert gate (refuse bump where signer_cert_sha256 changed)
-- [ ] GitHub Actions workflow running build.sh + invariants + artifact upload
+- [x] Repo scaffold (module.prop, META-INF, dir layout, .gitignore for apks/)
+      -- module.prop + vendored topjohnwu update-binary + #MAGISK updater-script;
+         placeholder customize.sh; .gitignore for apks/perms/components.conf/zip/pycache
+- [x] manifest.toml schema + 5 component entries (build-time pins: versionCode, url, apk sha256, signer-cert sha256)
+      -- GmsCore/GsfProxy/FakeStore (microG-signed) + MapsV1 (framework jar) + Phonesky
+         (deferred, empty-url marker); all sha256 = "PENDING-BUMP" until first bump
+- [x] lib/fetch.sh: download + 3-anchor verify (sha256 + apksigner verify + cert match)
+      -- type=app: 3 anchors; type=framework (jar): sha256-only; PENDING-BUMP = loud fail
+- [x] lib/genperms.py: requested(APK) INTERSECT privileged_perms(API) + FAKE_PACKAGE_SIGNATURE; separate sysconfig XML
+      -- Python; data-driven privileged-perms via data/privileged-perms-<api>.txt, unions API
+         levels; injectable requested-list for host tests; xmllint validation; XXE-hardened parser;
+         dump-requested subcommand (single requested-perms source for genperms + invariant)
+- [x] common/detect.sh (api, arch, root manager, mount engine, partition) + host BATS harness
+      -- pure read-only probes; GETPROP/DETECT_ROOT/DETECT_MOUNTS indirection for mocking; 28 BATS tests
+- [x] common/log.sh structured logging
+      -- selfcheck.log (MICROG_LOG_DIR overridable); mirrors ui_print/stderr; degrades quietly
+- [x] build.sh (hermetic): orchestrate fetch+genperms, assemble ZIP, emit slim components.conf from manifest
+      -- joins manifest.py list (fetch) + components.conf (place) by name; sidecars kept out of the zip
+- [x] bump tool (separate, network-trusting): rewrite manifest.toml from F-Droid/GitHub (tools/bump)
+      -- GitHub releases / F-Droid index-v2; hard-fails on signer-cert change; skips deferred + framework
+- [x] CI permission-invariant gate (requested_privileged subset-of allowlist; default-permissions subset-of declared; xmllint)
+      -- lib/invariant.py check-perms; host tests in test/genperms_test.py (31 tests, all pass)
+- [x] CI signer-cert gate (refuse bump where signer_cert_sha256 changed)
+      -- lib/invariant.py check-signer (operates on manifest.toml; reusable signer_cert_gate())
+- [x] GitHub Actions: build.sh + invariants + artifact upload + publish Release on tag; separate bump-PR workflow
+      -- .github/workflows/build.yml (checks -> build -> release-on-v*) + bump.yml (dispatch/weekly -> PR)
 
 ### Phase 1 -- Module-only installer (Magisk + KSU + APatch)
 - [ ] customize.sh manifest interpreter
@@ -65,12 +80,18 @@ Key principles:
 
 | Phase | Status | Tasks done |
 |-------|--------|------------|
-| Phase 0 -- Foundations + CI invariant | Pending | 0/11 |
+| Phase 0 -- Foundations + CI invariant | Code-complete* | 11/11 |
 | Phase 1 -- Module-only installer | Pending | 0/7 |
 | Phase 2 -- Phonesky + MapsV1 | Pending | 0/3 |
 | Phase 3 -- System-mode placement | Pending | 0/3 |
 | Phase 4 -- Recovery flashing | Pending | 0/2 |
 | Phase 5 -- Spoofing guide | Pending | 0/4 |
+
+\* Code-complete = all files written; host/CI verification is the user's to run
+(per directive: agent does not build/test/flash). The `build` CI job is RED until
+the first `tools/bump` fills real APK hashes (sha256 is "PENDING-BUMP" by design);
+the `checks` job (shellcheck/pytest/BATS) should be green. Run the `bump` workflow
+(or `tools/bump` locally) to produce real pins, then the build can publish.
 
 ## Decisions & Notes
 
@@ -90,3 +111,13 @@ Key principles:
   platform perms + FAKE_PACKAGE_SIGNATURE (APK manifest does not carry protection
   levels). (5) drop MinMicroG's variant matrix, resdl DSL, shell-generates-shell.
   microG signer cert SHA-256: 9bd06727e62796c0130eb6dab39b73157451582cbd138e86c468acc395d14165.
+- 2026-06-20 (Session 2): Phase 0 implemented via 4 parallel subagents (scaffold /
+  manifest+fetch+bump / detect+log+tests / genperms+invariant) + orchestrator glue
+  (build.sh, CI). Integration decisions: (a) perms XML filename is the on-device
+  lowercased contract perms/<name>.xml (manifest.py is the source of truth; aligned
+  invariant.py to it). (b) Added genperms `dump-requested` so a single requested-perms
+  sidecar feeds BOTH genperms and the invariant -- no apkanalyzer/aapt2 output drift.
+  (c) Sidecars staged under build/meta, kept OUT of the shipped ZIP. (d) CI is two
+  workflows: build.yml (hermetic build + checks + publish Release on tag v*) and
+  bump.yml (the only network step; opens a manifest-bump PR; weekly + on demand).
+  Publish target = GitHub Releases. APKs never committed; build red until first bump.

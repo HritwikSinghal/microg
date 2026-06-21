@@ -1,0 +1,57 @@
+# Privileged platform permissions -- AOSP API 34 (Android 14).
+#
+# WHAT THIS IS / HOW TO REGENERATE / SAFETY NOTE
+# See the long header in data/privileged-perms-30.txt -- the meaning, the
+# regeneration procedure (parse frameworks/base/core/res/AndroidManifest.xml for
+# protectionLevel containing "privileged"), and the under-list-bootlooping safety
+# rule are identical. This file holds the API 34 view; genperms.py unions a
+# couple of API levels (e.g. --api 34 also reads the 30 file when present) so a
+# perm that was privileged on an older platform stays grantable on devices still
+# running it. Prefer the superset when unsure.
+#
+# Delta vs API 30: API 31+ split BLUETOOTH into runtime perms and added a few
+# privileged entries microG / a real Play Store touch. Entries below are additive;
+# the union with the 30 file is what genperms intersects against.
+# Blank lines and lines starting with '#' are ignored.
+
+android.permission.ACCESS_COARSE_LOCATION
+android.permission.ACCESS_FINE_LOCATION
+android.permission.ACCESS_NETWORK_STATE
+android.permission.ACCESS_WIFI_STATE
+android.permission.BATTERY_STATS
+android.permission.BLUETOOTH_CONNECT
+android.permission.BLUETOOTH_PRIVILEGED
+android.permission.BLUETOOTH_SCAN
+android.permission.CHANGE_COMPONENT_ENABLED_STATE
+android.permission.CHANGE_CONFIGURATION
+android.permission.CLEAR_APP_CACHE
+android.permission.CONTROL_LOCATION_UPDATES
+android.permission.DELETE_CACHE_FILES
+android.permission.DELETE_PACKAGES
+android.permission.DUMP
+android.permission.FAKE_PACKAGE_SIGNATURE
+android.permission.FORCE_STOP_PACKAGES
+android.permission.GET_ACCOUNTS_PRIVILEGED
+android.permission.GET_PACKAGE_SIZE
+android.permission.INSTALL_LOCATION_PROVIDER
+android.permission.INSTALL_PACKAGES
+android.permission.INSTALL_PACKAGE_UPDATES
+android.permission.INTERACT_ACROSS_USERS
+android.permission.INTERACT_ACROSS_USERS_FULL
+android.permission.LOCATION_HARDWARE
+android.permission.MANAGE_USERS
+android.permission.MODIFY_PHONE_STATE
+android.permission.MOUNT_UNMOUNT_FILESYSTEMS
+android.permission.PACKAGE_USAGE_STATS
+android.permission.READ_PRIVILEGED_PHONE_STATE
+android.permission.REAL_GET_TASKS
+android.permission.RECEIVE_EMERGENCY_BROADCAST
+android.permission.SEND_SMS_NO_CONFIRMATION
+android.permission.SET_PREFERRED_APPLICATIONS
+android.permission.START_ACTIVITIES_FROM_BACKGROUND
+android.permission.STATUS_BAR
+android.permission.UPDATE_APP_OPS_STATS
+android.permission.UPDATE_DEVICE_STATS
+android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION
+android.permission.WRITE_APN_SETTINGS
+android.permission.WRITE_SECURE_SETTINGS

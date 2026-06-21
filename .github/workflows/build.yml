@@ -1,0 +1,136 @@
+name: build
+
+# Hermetic build + host checks + (on tags) publish a GitHub Release.
+# RESOLVE (tools/bump) is intentionally NOT here -- it is the only
+# network-trusting step and runs in bump.yml so this workflow stays hermetic.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the release job needs to create releases on tag pushes
+
+jobs:
+  # Host-side checks (design spec section 8). Fast, no Android SDK, no network.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install host tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck bats libxml2-utils
+
+      - name: Shellcheck
+        run: |
+          shellcheck \
+            build.sh \
+            lib/fetch.sh \
+            common/detect.sh \
+            common/log.sh \
+            customize.sh \
+            META-INF/com/google/android/update-binary \
+            test/fixtures/fake-getprop.sh
+
+      - name: Python syntax (py_compile)
+        run: |
+          python3 -m py_compile lib/manifest.py lib/genperms.py lib/invariant.py
+          python3 -m py_compile tools/bump
+
+      - name: Python unit tests
+        # The suite is stdlib unittest and inserts lib/ on sys.path itself, so
+        # run the module directly -- no pytest dependency on the runner.
+        run: python3 test/genperms_test.py
+
+      - name: BATS unit tests
+        run: bats test/
+
+      - name: Manifest parses and components.conf emits
+        run: |
+          python3 lib/manifest.py emit-conf --out /tmp/components.conf
+          cat /tmp/components.conf
+
+  # Hermetic build of the flashable ZIP. Requires Android build-tools for
+  # apksigner (signer-cert verify) and apkanalyzer (requested-perms read).
+  # NEUTRAL-SKIPS (stays green) while any non-deferred component still carries an
+  # unpinned PENDING-BUMP hash -- that is the expected pre-bump state, not a
+  # breakage. Run the bump workflow (and hand-pin MapsV1) to enable a real build.
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.pins.outputs.bumped }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check the manifest is pinned (not PENDING-BUMP)
+        id: pins
+        run: |
+          if python3 lib/manifest.py list | awk -F'\t' 'NR>1 && $3=="PENDING-BUMP"{f=1} END{exit f?0:1}'; then
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::manifest.toml has unpinned (PENDING-BUMP) hashes -- skipping build and publish. Run the bump workflow to pin real APK hashes."
+          else
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.pins.outputs.bumped == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        if: steps.pins.outputs.bumped == 'true'
+
+      - name: Install Android build-tools
+        if: steps.pins.outputs.bumped == 'true'
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "build-tools;34.0.0" "cmdline-tools;latest"
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+      - name: Install host tools
+        if: steps.pins.outputs.bumped == 'true'
+        run: sudo apt-get update && sudo apt-get install -y zip libxml2-utils
+
+      - name: Build flashable ZIP
+        if: steps.pins.outputs.bumped == 'true'
+        run: ./build.sh
+
+      - name: Upload ZIP artifact
+        if: steps.pins.outputs.bumped == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: microg-installer-zip
+          path: out/*.zip
+          if-no-files-found: error
+
+  # Publish a GitHub Release with the ZIP attached, on tag pushes only.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: microg-installer-zip
+          path: out
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.zip
+          generate_release_notes: true

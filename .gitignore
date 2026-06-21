@@ -1,12 +1,34 @@
-# Build output
+# Build output -- the assembled flashable ZIP and any work dirs
 /build/
 /dist/
+/out/
 *.zip
 
-# Downloaded, SHA-pinned APKs are fetched at build time, never committed
-/apks/*.apk
-/apks/*.jar
+# Downloaded, SHA-pinned APKs and the MapsV1 JAR are fetched at build
+# time and verified against manifest.toml; never committed.
+apks/*.apk
+apks/*.jar
 
-# Editor / OS
+# Build-time-generated, version-matched permission XML variants.
+perms/*.xml
+
+# Slim install-time manifest emitted from manifest.toml during packaging.
+/components.conf
+
+# Keep the placeholder files so the (otherwise-ignored) dirs exist in git.
+!apks/.gitkeep
+!perms/.gitkeep
+
+# Python caches from the build-time tools / host tests
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor / OS cruft
 *.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/

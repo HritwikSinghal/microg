@@ -1,0 +1,83 @@
+#!/sbin/sh
+
+#################################################################
+# microG Universal Installer -- module update-binary
+#
+# VENDORED, unmodified in behavior, from topjohnwu's Magisk module
+# template:
+#   https://github.com/topjohnwu/Magisk -> scripts/module_installer.sh
+#   (a.k.a. the magisk-module-template "update-binary" stub)
+#
+# Magisk module convention chain:
+#   update-binary  ->  util_functions.sh  ->  install_module  ->  customize.sh
+#
+# This is the standard entry point every Magisk-compatible root
+# manager (Magisk, KernelSU, APatch) invokes when flashing a ZIP
+# whose updater-script is the single line "#MAGISK". It detects
+# boot vs recovery mode, locates the installed root manager's
+# util_functions.sh, then runs install_module which extracts the
+# module and sources our customize.sh. Keep this file generic; all
+# module-specific logic belongs in customize.sh.
+#
+# Flasher-supplied arguments:
+#   $1 : RECOVERY_API_VERSION   (unused)
+#   $2 : OUTFD  -- recovery progress pipe fd
+#   $3 : ZIPFILE -- full path to the flashable ZIP
+#################################################################
+
+#MAGISK
+############################################
+# Magisk Module Installer Script (stub)
+############################################
+
+umask 022
+
+# Default permissions
+OUTFD=$2
+# shellcheck disable=SC2034  # ZIPFILE is consumed by the sourced util_functions.sh / install_module
+ZIPFILE=$3
+
+# Detect boot mode: true when flashed from the root manager app,
+# false when run from a custom recovery.
+if [ -z "$BOOTMODE" ]; then
+  # shellcheck disable=SC2009  # ps|grep zygote is the portable busybox-recovery probe; pgrep may be absent
+  ps | grep zygote | grep -qv grep && BOOTMODE=true
+fi
+if [ -z "$BOOTMODE" ]; then
+  # shellcheck disable=SC2009  # see above; -A form for toybox/recovery shells
+  ps -A 2>/dev/null | grep zygote | grep -qv grep && BOOTMODE=true
+fi
+BOOTMODE=${BOOTMODE:-false}
+
+# Print a line to the recovery UI (no-op formatting in boot mode).
+ui_print() {
+  if $BOOTMODE; then
+    echo "$1"
+  else
+    # shellcheck disable=SC3037  # busybox/recovery echo supports -e; this is the Magisk idiom
+    echo -e "ui_print $1\nui_print" >> /proc/self/fd/"$OUTFD"
+  fi
+}
+
+# Abort the flash with a message.
+require_new_magisk() {
+  ui_print "*******************************"
+  ui_print " Please install Magisk v20.4+! "
+  ui_print "*******************************"
+  exit 1
+}
+
+# Locate and source the installed root manager helper functions.
+# These define mount_partitions, api_level_arch_detect,
+# install_module, etc. /data/adb/magisk is the canonical path for
+# Magisk, KernelSU, and APatch alike.
+MAGISKBIN=/data/adb/magisk
+[ -f "$MAGISKBIN/util_functions.sh" ] || require_new_magisk
+
+# shellcheck source=/dev/null
+. "$MAGISKBIN/util_functions.sh"
+
+# Drive the standard module install flow: extracts the module from
+# $ZIPFILE into $MODPATH, then sources customize.sh.
+install_module
+exit 0
