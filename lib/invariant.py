@@ -11,10 +11,19 @@ gates:
         the target API) MUST be a SUBSET of the generated privapp-permissions
         allowlist. If the APK starts requesting a new privileged permission that
         genperms did not allowlist, stock "enforce" mode boot-loops -- so this
-        fails the build with a precise diff instead.
+        fails the build with a precise diff instead. The privileged set is now
+        derived authoritatively from the pinned AOSP platform-perms tables, not a
+        hand-curated subset.
      b. Every entry in a component's default-permissions file MUST actually be
         declared/requested by the APK. A default-permissions grant for a perm the
         app does not request is dead config at best and wrong at worst.
+     c. UNKNOWN-PERMISSION GUARD (fail-closed): every requested android.permission.*
+        name MUST be classifiable against the pinned AOSP platform-all table. A
+        requested platform perm absent from EVERY pinned table cannot be judged
+        privileged-or-not, so genperms may silently drop it and (a) cannot see it
+        -- a latent bootloop. The build FAILS rather than guess. The guard runs
+        only when a platform-all source is available (it does with --api/data-dir);
+        with no full table it degrades off.
    All generated XML is validated with `xmllint --noout`.
 
 2. signer_cert_gate
@@ -104,12 +113,25 @@ def read_allowlist_xml(path: Path) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Gate 1: permission invariant.
 # --------------------------------------------------------------------------- #
+# android.permission.* names that are microG-custom (not declared by AOSP) and
+# therefore legitimately absent from the platform-all table. They must never trip
+# the unknown-permission guard. FAKE_PACKAGE_SIGNATURE is the only such name today;
+# it is handled separately (folded into the allowlist) by the under-list check.
+KNOWN_CUSTOM_PLATFORM_NAMES: frozenset[str] = frozenset({FAKE_PACKAGE_SIGNATURE})
+
+# AOSP permission names live under this prefix. The unknown-guard only polices
+# this namespace; microG's own org.microg.* / com.google.* perms are out of scope
+# (they cannot be platform-privileged and so cannot cause a priv-app bootloop).
+_PLATFORM_PREFIX = "android.permission."
+
+
 def check_permission_invariant(
     component: str,
     requested: set[str],
     privileged: set[str],
     allowlist: set[str],
     default_perms: set[str] | None = None,
+    platform_all: set[str] | None = None,
 ) -> CheckResult:
     """Assert the permission invariant for one component (spec 6.2).
 
@@ -120,6 +142,16 @@ def check_permission_invariant(
        required set.
     b. default_perms MUST be subset of requested (no granting a perm the app does
        not even ask for).
+    c. UNKNOWN-PERMISSION GUARD (fail-closed): when ``platform_all`` is provided,
+       every requested android.permission.* name MUST be classifiable -- i.e.
+       present in the pinned AOSP platform-all table (or a known microG-custom
+       name). A requested platform permission we cannot find in ANY pinned table
+       is unclassifiable: we cannot tell whether it is a harmless normal perm or a
+       privileged one we forgot to pin, so genperms might silently DROP it and the
+       under-list check (a) cannot see it -> latent bootloop. We refuse to guess
+       and FAIL the build. When ``platform_all`` is None the guard DEGRADES OFF
+       (e.g. only a name-only privileged list was supplied -- classification is
+       impossible without the full table, so we cannot run the guard).
     """
     result = CheckResult()
 
@@ -139,6 +171,26 @@ def check_permission_invariant(
                 ),
             )
         )
+
+    if platform_all is not None:
+        req_platform = {p for p in requested if p.startswith(_PLATFORM_PREFIX)}
+        unknown = req_platform - platform_all - KNOWN_CUSTOM_PLATFORM_NAMES
+        if unknown:
+            result.violations.append(
+                Violation(
+                    component=component,
+                    kind="unclassifiable platform permission (refusing to guess; "
+                    "would risk a BOOTLOOP)",
+                    detail=(
+                        "unclassifiable platform permission(s) "
+                        + ", ".join(sorted(unknown))
+                        + ": not found in pinned AOSP tables (api 30/33/34/35). "
+                        "Pin the AOSP manifest for the target API or add them to "
+                        "platform-perms data. Refusing to guess (would risk a "
+                        "bootloop)."
+                    ),
+                )
+            )
 
     if default_perms:
         undeclared = default_perms - requested
@@ -286,7 +338,14 @@ def run_check_perms(
     no privapp-permissions allowlist, so they are skipped here.
     """
     manifest = _load_toml(manifest_path)
-    privileged = genperms.load_privileged_perms(api, data_dir)
+    # Derive BOTH the privileged set and the platform-all set from the single
+    # pinned platform-perms table for the target API (unioned over levels <= api),
+    # mirroring genperms. platform_all powers the fail-closed unknown-guard; it is
+    # the authoritative classifier, so it must come from the same source as the
+    # privileged set or the two gates could disagree.
+    table = genperms.load_platform_table(api, data_dir)
+    privileged = genperms.privileged_names(table)
+    platform_all = genperms.all_platform_names(table)
     aggregate = CheckResult()
 
     for entry in manifest.get("apk", []):
@@ -329,6 +388,7 @@ def run_check_perms(
             privileged=privileged,
             allowlist=allowlist,
             default_perms=default_perms,
+            platform_all=platform_all,
         )
         aggregate.violations.extend(component_result.violations)
 
@@ -409,7 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
     perms.add_argument(
         "--data-dir",
         default=str(genperms.DEFAULT_DATA_DIR),
-        help="dir of privileged-perms-<api>.txt (default: repo data/)",
+        help="dir of platform-perms-<api>.txt (default: repo data/)",
     )
     perms.set_defaults(func=cmd_check_perms)
 

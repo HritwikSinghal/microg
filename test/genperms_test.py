@@ -154,21 +154,55 @@ class RequestedParsingTests(unittest.TestCase):
         )
 
 
-class PrivilegedLoadingTests(unittest.TestCase):
-    """Loading the privileged-perms data files (real repo data/)."""
+class PlatformPermsLoadingTests(unittest.TestCase):
+    """Loading the platform-perms-<api>.txt tables (real repo data/).
 
-    def test_loads_target_api_and_unions_extra(self) -> None:
+    The new data model is a single per-API table of '<name><TAB><level>' from
+    which BOTH the privileged set and the platform-all set are derived. These
+    tests exercise the real checked-in data so a regenerate that loses an entry
+    (e.g. CHANGE_DEVICE_IDLE_TEMP_WHITELIST) is caught.
+    """
+
+    def test_loads_target_api_and_unions_lower_levels(self) -> None:
         perms = genperms.load_privileged_perms(34, REPO_ROOT / "data")
-        # FAKE is intentionally present in the data file as a documented entry,
-        # but the generator does not rely on that -- intersection tests above
-        # prove FAKE is added regardless.
+        # Present at API 30+ and privileged on every covered level.
         self.assertIn("android.permission.WRITE_SECURE_SETTINGS", perms)
-        # API 34-only entry should appear after the union pulls in the 34 file.
-        self.assertIn("android.permission.BLUETOOTH_CONNECT", perms)
-        # API 30-only entry should appear because 30 is unioned in by default.
+        # A genuine API-34-only privileged entry -- proves the 34 table is read.
+        self.assertIn("android.permission.ACCESS_SMARTSPACE", perms)
+        # An API-30 entry -- proves 30 is unioned in for a target of 34.
         self.assertIn("android.permission.SEND_SMS_NO_CONFIRMATION", perms)
+        # The Doze-exemption perm the design specifically calls out.
+        self.assertIn("android.permission.CHANGE_DEVICE_IDLE_TEMP_WHITELIST", perms)
+
+    def test_internet_is_not_privileged(self) -> None:
+        # INTERNET is normal|instant in AOSP: it must be in the platform-all set
+        # but NOT in the privileged set, or genperms would wrongly allowlist it.
+        table = genperms.load_platform_table(34, REPO_ROOT / "data")
+        self.assertIn("android.permission.INTERNET", genperms.all_platform_names(table))
+        self.assertNotIn(
+            "android.permission.INTERNET", genperms.privileged_names(table)
+        )
+
+    def test_fake_signature_absent_from_platform_tables(self) -> None:
+        # FAKE_PACKAGE_SIGNATURE is microG-custom: it must never appear in any
+        # pinned AOSP table (it is added by the generator, not classified here).
+        table = genperms.load_platform_table(35, REPO_ROOT / "data")
+        self.assertNotIn(FAKE, genperms.all_platform_names(table))
+
+    def test_union_grows_with_api(self) -> None:
+        # api 35 unions all four levels; api 30 unions only 30. The 35 table must
+        # be a strict superset of the 30 table (additive AOSP growth).
+        t30 = genperms.all_platform_names(
+            genperms.load_platform_table(30, REPO_ROOT / "data")
+        )
+        t35 = genperms.all_platform_names(
+            genperms.load_platform_table(35, REPO_ROOT / "data")
+        )
+        self.assertTrue(t30.issubset(t35))
+        self.assertGreater(len(t35), len(t30))
 
     def test_missing_target_api_file_raises(self) -> None:
+        # 999 is above every pinned level -> no table to union -> hard error.
         with self.assertRaises(genperms.GenPermsError):
             genperms.load_privileged_perms(999, REPO_ROOT / "data")
 
@@ -189,6 +223,96 @@ class PrivilegedLoadingTests(unittest.TestCase):
             p.write_text(manifest, encoding="ascii")
             out = genperms.privileged_perms_from_aosp_manifest(p)
         self.assertEqual(out, {"a.PRIV", "a.DEV"})
+
+
+class ExtractPermsTests(unittest.TestCase):
+    """extract-perms: AOSP manifest -> name<TAB>level table, and derivation."""
+
+    _MANIFEST = (
+        '<?xml version="1.0"?>\n'
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '  <permission android:name="a.PRIV" '
+        'android:protectionLevel="signature|privileged"/>\n'
+        '  <permission android:name="a.NORMAL" '
+        'android:protectionLevel="normal"/>\n'
+        '  <permission android:name="a.SIG" '
+        'android:protectionLevel="signature"/>\n'
+        "</manifest>\n"
+    )
+
+    def _write_manifest(self, tmp: str) -> Path:
+        p = Path(tmp) / "AndroidManifest.xml"
+        p.write_text(self._MANIFEST, encoding="ascii")
+        return p
+
+    def test_table_carries_name_and_level(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            table = genperms.platform_table_from_aosp_manifest(
+                self._write_manifest(tmp)
+            )
+        self.assertEqual(
+            table,
+            {
+                "a.PRIV": "signature|privileged",
+                "a.NORMAL": "normal",
+                "a.SIG": "signature",
+            },
+        )
+
+    def test_privileged_set_derived_correctly(self) -> None:
+        # A 'signature|privileged' entry is privileged; 'normal' / 'signature'
+        # are not. This is the rule that makes the data authoritative.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = genperms.platform_table_from_aosp_manifest(
+                self._write_manifest(tmp)
+            )
+        self.assertEqual(genperms.privileged_names(table), {"a.PRIV"})
+        self.assertEqual(
+            genperms.all_platform_names(table), {"a.PRIV", "a.NORMAL", "a.SIG"}
+        )
+
+    def test_extract_perms_cli_writes_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._write_manifest(tmp)
+            out = Path(tmp) / "platform-perms-99.txt"
+            rc = genperms.main(
+                [
+                    "extract-perms",
+                    "--aosp-manifest",
+                    str(manifest),
+                    "--api",
+                    "99",
+                    "--out",
+                    str(out),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertTrue(out.is_file())
+            # Round-trip: loading the file back must reproduce the table.
+            loaded = genperms.load_platform_perms([out])
+            self.assertEqual(loaded["a.PRIV"], "signature|privileged")
+            self.assertEqual(genperms.privileged_names(loaded), {"a.PRIV"})
+            # Header documents the api and is comment-only (ignored by loader).
+            text = out.read_text(encoding="ascii")
+            self.assertIn("AOSP API 99", text)
+
+    def test_union_merges_levels_without_losing_privileged_flag(self) -> None:
+        # Same perm at differing levels across tables: the merged level must keep
+        # the privileged flag (under-listing bootloops; over-listing is harmless).
+        with tempfile.TemporaryDirectory() as tmp:
+            low = Path(tmp) / "platform-perms-1.txt"
+            high = Path(tmp) / "platform-perms-2.txt"
+            low.write_text("a.X\tsignature|privileged\n", encoding="ascii")
+            high.write_text("a.X\tsignature\n", encoding="ascii")
+            merged = genperms.load_platform_perms([low, high])
+        self.assertIn("a.X", genperms.privileged_names(merged))
+
+    def test_malformed_line_without_tab_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "platform-perms-1.txt"
+            bad.write_text("a.X no_tab_here\n", encoding="ascii")
+            with self.assertRaises(genperms.GenPermsError):
+                genperms.load_platform_perms([bad])
 
 
 class XmlGenerationTests(unittest.TestCase):
@@ -225,8 +349,11 @@ class XmlGenerationTests(unittest.TestCase):
             genperms.generate_sysconfig_file(["com.google.android.gms"], out)
             text = out.read_text(encoding="ascii")
             genperms.validate_xml(out)
-            # Behavioral exemptions live here, NOT in any allowlist.
+            # Behavioral exemptions live here, NOT in any allowlist. All three
+            # canonical microG entries must be present (data-usage-save guards
+            # push under Data Saver).
             self.assertIn("allow-in-power-save", text)
+            self.assertIn("allow-in-data-usage-save", text)
             self.assertIn("allow-unthrottled-location", text)
             self.assertNotIn("privapp-permissions", text)
 
@@ -315,6 +442,106 @@ class PermissionInvariantTests(unittest.TestCase):
             "GmsCore", requested, privileged, allowlist
         )
         self.assertTrue(result.ok, result.report())
+
+
+class UnknownPermissionGuardTests(unittest.TestCase):
+    """invariant unknown-permission guard: fail-closed on unclassifiable perms.
+
+    The guard is the heart of this task: if an APK requests an android.permission.*
+    that is in NO pinned AOSP table, genperms cannot tell privileged from normal
+    and may silently drop it -> latent bootloop. The build must FAIL instead.
+    """
+
+    # A tiny stand-in platform-all set: INTERNET is a known normal perm; the
+    # privileged set is empty for these guard-focused cases.
+    PLATFORM_ALL = {
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_FINE_LOCATION",
+    }
+
+    def test_fails_on_unknown_platform_permission(self) -> None:
+        requested = {"android.permission.SOME_NEW_PRIVILEGED_PERM"}
+        result = invariant.check_permission_invariant(
+            "GmsCore",
+            requested,
+            privileged=set(),
+            allowlist=set(),
+            platform_all=self.PLATFORM_ALL,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("SOME_NEW_PRIVILEGED_PERM", result.report())
+        self.assertIn("unclassifiable", result.report())
+        self.assertIn("BOOTLOOP", result.report())
+
+    def test_passes_on_known_normal_permission(self) -> None:
+        # INTERNET is in the platform-all table (and not privileged) -> no guard
+        # violation, nothing required in the allowlist.
+        requested = {"android.permission.INTERNET"}
+        result = invariant.check_permission_invariant(
+            "GmsCore",
+            requested,
+            privileged=set(),
+            allowlist=set(),
+            platform_all=self.PLATFORM_ALL,
+        )
+        self.assertTrue(result.ok, result.report())
+
+    def test_fake_signature_is_not_flagged_as_unknown(self) -> None:
+        # FAKE is microG-custom (android.permission.* but absent from AOSP); it is
+        # an explicitly-known-custom name and must NOT trip the guard.
+        requested = {FAKE}
+        allowlist = {FAKE}  # so the under-list check is also satisfied
+        result = invariant.check_permission_invariant(
+            "GmsCore",
+            requested,
+            privileged=set(),
+            allowlist=allowlist,
+            platform_all=self.PLATFORM_ALL,
+        )
+        self.assertTrue(result.ok, result.report())
+
+    def test_non_platform_namespace_is_ignored_by_guard(self) -> None:
+        # microG's own org.microg.* perms are out of the android.permission.*
+        # namespace; they cannot be platform-privileged and are not policed here.
+        requested = {"org.microg.gms.STATUS_BROADCAST"}
+        result = invariant.check_permission_invariant(
+            "GmsCore",
+            requested,
+            privileged=set(),
+            allowlist=set(),
+            platform_all=self.PLATFORM_ALL,
+        )
+        self.assertTrue(result.ok, result.report())
+
+    def test_guard_degrades_off_when_no_platform_table(self) -> None:
+        # platform_all=None (e.g. only a name-only --priv-file was supplied):
+        # classification is impossible, so the guard must NOT fire (and must not
+        # crash). The under-list check still runs.
+        requested = {"android.permission.SOME_UNKNOWN_PERM"}
+        result = invariant.check_permission_invariant(
+            "GmsCore",
+            requested,
+            privileged=set(),
+            allowlist=set(),
+            platform_all=None,
+        )
+        self.assertTrue(result.ok, result.report())
+
+    def test_guard_runs_against_real_data_and_fails(self) -> None:
+        # Against the real pinned tables, a fabricated android.permission.* must
+        # be rejected, while a real privileged perm requested + allowlisted passes.
+        table = genperms.load_platform_table(34, REPO_ROOT / "data")
+        priv = genperms.privileged_names(table)
+        alln = genperms.all_platform_names(table)
+        bad = invariant.check_permission_invariant(
+            "GmsCore",
+            {"android.permission.DEFINITELY_NOT_A_REAL_AOSP_PERM"},
+            privileged=priv,
+            allowlist=set(),
+            platform_all=alln,
+        )
+        self.assertFalse(bad.ok)
+        self.assertIn("unclassifiable", bad.report())
 
 
 class SignerCertGateTests(unittest.TestCase):

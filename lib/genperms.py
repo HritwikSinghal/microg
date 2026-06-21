@@ -51,9 +51,15 @@ from xml.dom import minidom
 # uses android.permission.FAKE_PACKAGE_SIGNATURE; that is what we emit.
 FAKE_PACKAGE_SIGNATURE = "android.permission.FAKE_PACKAGE_SIGNATURE"
 
-# Default directory holding the checked-in privileged-perms-<api>.txt data files.
+# Default directory holding the checked-in platform-perms-<api>.txt data files.
 # Resolved relative to this file so it works regardless of the caller's cwd.
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# API levels we ship pinned AOSP platform-perms tables for. A target --api N
+# unions every available level <= N (see load_platform_perms): a perm privileged
+# on ANY covered level, if requested, gets allowlisted (harmless where it is not
+# privileged). These four cover the realistic stock-Android install base.
+PINNED_APIS: tuple[int, ...] = (30, 33, 34, 35)
 
 # AOSP framework manifest namespace, used when parsing a real core/res manifest.
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
@@ -191,45 +197,120 @@ def read_requested_file(path: Path) -> set[str]:
 
 
 # --------------------------------------------------------------------------- #
-# privileged_perms(API): which platform perms are "privileged".
+# platform_perms(API): the AUTHORITATIVE per-API platform permission table.
+#
+# The data model is a single file per API, data/platform-perms-<api>.txt, listing
+# EVERY platform <permission> with its raw AOSP protectionLevel, one entry per
+# line as "<name><TAB><level>". From this ONE table genperms derives BOTH:
+#   - the PRIVILEGED set: names whose protectionLevel flag list contains
+#     "privileged" (what a /system/priv-app may be allowlisted for); and
+#   - the PLATFORM-ALL set: every platform permission name (used by the invariant
+#     to fail-closed on a requested android.permission.* it cannot classify).
+#
+# The old privileged-perms-<api>.txt files (a name-only privileged subset) are
+# superseded: a hand-curated privileged subset can only support the under-list
+# check, never the unknown-permission guard, because it cannot say whether an
+# UNlisted perm is a harmless normal perm or a privileged one we forgot. Deriving
+# both sets from the full AOSP table is what makes the guard authoritative.
 # --------------------------------------------------------------------------- #
+def _is_privileged_level(level: str) -> bool:
+    """True if a raw protectionLevel string carries the 'privileged' flag.
+
+    protectionLevel is a '|'-joined flag list, e.g. "signature|privileged" or
+    "signature|privileged|development". A bare base level ("normal", "signature",
+    "dangerous") is not privileged.
+    """
+    return "privileged" in level.split("|")
+
+
+def load_platform_perms(paths: list[Path]) -> dict[str, str]:
+    """Load and union platform-perms tables into a name->protectionLevel map.
+
+    Each path is a data/platform-perms-<api>.txt file: "<name><TAB><level>" per
+    line, '#' comments and blanks ignored. When the same permission appears in
+    more than one API table with differing levels, the levels are merged by
+    UNION of their '|'-flags so the privileged flag is never lost across levels
+    (under-listing bootloops; over-listing is harmless -- spec 6.1).
+    """
+    merged: dict[str, set[str]] = {}
+    for path in paths:
+        if not path.is_file():
+            continue
+        for raw in path.read_text(encoding="ascii").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "\t" not in line:
+                raise GenPermsError(
+                    f"malformed platform-perms line in {path} (expected "
+                    f"'<name><TAB><level>'): {line!r}"
+                )
+            name, level = line.split("\t", 1)
+            name = name.strip()
+            flags = {f for f in level.strip().split("|") if f}
+            merged.setdefault(name, set()).update(flags)
+    return {name: "|".join(sorted(flags)) for name, flags in merged.items()}
+
+
+def privileged_names(table: dict[str, str]) -> set[str]:
+    """The privileged-name set derived from a platform-perms table."""
+    return {name for name, level in table.items() if _is_privileged_level(level)}
+
+
+def all_platform_names(table: dict[str, str]) -> set[str]:
+    """The platform-all (every-name) set derived from a platform-perms table."""
+    return set(table.keys())
+
+
+def _platform_perms_paths(api: int, data_dir: Path) -> list[Path]:
+    """Resolve the platform-perms-<level>.txt paths to union for a target API.
+
+    Union semantics (spec 6.1): every PINNED level <= api whose file exists. A
+    missing target-API table is a hard error so a typo never yields an empty,
+    bootloop-inducing allowlist; lower-level files are optional.
+    """
+    levels = sorted(level for level in PINNED_APIS if level <= api)
+    if not levels:
+        raise GenPermsError(
+            f"no pinned platform-perms tables at or below target API {api}; "
+            f"pinned levels are {', '.join(map(str, PINNED_APIS))}."
+        )
+    target = max(levels)
+    target_file = data_dir / f"platform-perms-{target}.txt"
+    if not target_file.is_file():
+        raise GenPermsError(
+            f"platform-perms data file not found for API {target}: "
+            f"{target_file}. See data/platform-perms-30.txt for the format and "
+            f"the extract-perms regeneration command."
+        )
+    return [data_dir / f"platform-perms-{level}.txt" for level in levels]
+
+
+def load_platform_table(api: int, data_dir: Path = DEFAULT_DATA_DIR) -> dict[str, str]:
+    """Load the unioned platform-perms table for a target API from the data dir."""
+    return load_platform_perms(_platform_perms_paths(api, data_dir))
+
+
 def load_privileged_perms(
     api: int,
     data_dir: Path = DEFAULT_DATA_DIR,
-    extra_apis: tuple[int, ...] = (30,),
 ) -> set[str]:
-    """Load the privileged-perms set for `api`, unioned with `extra_apis`.
+    """Load the privileged-perms set for `api` from the unioned platform table.
 
-    Reads data/privileged-perms-<api>.txt for the target API and unions it with
-    the listed extra API files when present (spec 6.1: "union a couple of API
-    levels to be safe" -- a perm privileged on an older platform stays grantable
-    on devices still running it). Missing extra-API files are skipped silently;
-    a missing target-API file is a hard error so a typo never yields an empty,
-    bootloop-inducing allowlist.
+    Reads data/platform-perms-<api>.txt (and lower pinned levels) and derives the
+    privileged set as the names whose protectionLevel carries "privileged". A
+    perm privileged on ANY covered level is included (harmless where it is not).
     """
-    apis = {api, *extra_apis}
-    perms: set[str] = set()
-    target_file = data_dir / f"privileged-perms-{api}.txt"
-    if not target_file.is_file():
-        raise GenPermsError(
-            f"privileged-perms data file not found for target API {api}: "
-            f"{target_file}. See data/privileged-perms-30.txt for the format "
-            f"and regeneration steps."
-        )
-    for level in sorted(apis):
-        path = data_dir / f"privileged-perms-{level}.txt"
-        if path.is_file():
-            perms |= _read_perm_list_file(path)
-    return perms
+    return privileged_names(load_platform_table(api, data_dir))
 
 
-def privileged_perms_from_aosp_manifest(manifest_path: Path) -> set[str]:
-    """Parse an AOSP core/res AndroidManifest.xml for privileged permissions.
+def platform_table_from_aosp_manifest(manifest_path: Path) -> dict[str, str]:
+    """Parse an AOSP core/res AndroidManifest.xml into a name->level table.
 
-    Returns the names of every <permission> whose android:protectionLevel
-    contains the "privileged" flag. This is the same rule the data-file
-    regeneration procedure documents; offered so a build with a checked-out AOSP
-    tree can compute the set directly instead of relying on the curated file.
+    Returns EVERY <permission> with its raw android:protectionLevel string (empty
+    string if the attribute is absent). This is the authoritative source from
+    which both the privileged set and the platform-all set are derived; the
+    checked-in data files are generated from exactly this via `extract-perms`.
     """
     if not manifest_path.is_file():
         raise GenPermsError(f"AOSP manifest not found: {manifest_path}")
@@ -240,13 +321,29 @@ def privileged_perms_from_aosp_manifest(manifest_path: Path) -> set[str]:
 
     name_attr = f"{{{ANDROID_NS}}}name"
     level_attr = f"{{{ANDROID_NS}}}protectionLevel"
-    perms: set[str] = set()
+    table: dict[str, str] = {}
     for perm in tree.getroot().iter("permission"):
-        level = perm.get(level_attr, "")
         name = perm.get(name_attr, "")
-        # protectionLevel is a '|'-joined flag list, e.g. "signature|privileged".
-        if name and "privileged" in level.split("|"):
-            perms.add(name)
+        level = perm.get(level_attr, "")
+        if name:
+            table[name] = level
+    if not table:
+        raise GenPermsError(
+            f"no <permission> entries found in {manifest_path}; is this an "
+            f"AOSP core/res AndroidManifest.xml?"
+        )
+    return table
+
+
+def privileged_perms_from_aosp_manifest(manifest_path: Path) -> set[str]:
+    """Parse an AOSP manifest for privileged permission names (convenience).
+
+    Thin wrapper over platform_table_from_aosp_manifest + privileged_names, kept
+    so a build with a checked-out AOSP tree can compute the privileged set
+    directly. Raises if the manifest declares zero privileged perms (a sign the
+    wrong file was passed).
+    """
+    perms = privileged_names(platform_table_from_aosp_manifest(manifest_path))
     if not perms:
         raise GenPermsError(
             f"no privileged permissions found in {manifest_path}; is this an "
@@ -255,8 +352,60 @@ def privileged_perms_from_aosp_manifest(manifest_path: Path) -> set[str]:
     return perms
 
 
+def render_platform_perms_file(table: dict[str, str], api: int) -> str:
+    """Render a name->level table as a checked-in platform-perms-<api>.txt body.
+
+    Documented header (source tag is filled by the regenerate command, recorded
+    by whoever runs extract-perms), then one "<name><TAB><level>" entry per line,
+    sorted by name for deterministic, diffable output. ASCII only.
+    """
+    header = [
+        f"# Platform permissions -- AOSP API {api}.",
+        "#",
+        "# WHAT THIS IS",
+        "# Every platform-defined <permission> from the AOSP framework manifest",
+        "# (frameworks/base/core/res/AndroidManifest.xml) for this API, with its",
+        "# raw protectionLevel. Format: one entry per line, '<name><TAB><level>'.",
+        "# '#' comments and blank lines are ignored. Sorted by name.",
+        "#",
+        "# genperms.py derives BOTH sets from this single table:",
+        "#   - privileged set = names whose protectionLevel contains 'privileged'",
+        "#     (signature|privileged, signature|privileged|development, ...);",
+        "#   - platform-all set = every name here (the invariant's fail-closed",
+        "#     unknown-permission guard rejects any requested android.permission.*",
+        "#     that is absent from this set across all pinned APIs).",
+        "#",
+        "# HOW TO REGENERATE (per target API on an AOSP bump)",
+        "# Fetch the AOSP core/res AndroidManifest.xml at the platform release tag",
+        "# from aosp-mirror/platform_frameworks_base, then run extract-perms:",
+        "#   curl -fsSL \\",
+        "#     https://raw.githubusercontent.com/aosp-mirror/platform_frameworks_base/<TAG>/core/res/AndroidManifest.xml \\",
+        "#     -o /tmp/AndroidManifest-<api>.xml",
+        f"#   python3 lib/genperms.py extract-perms --aosp-manifest /tmp/AndroidManifest-{api}.xml \\",
+        f"#     --api {api} --out data/platform-perms-{api}.txt",
+        "#",
+        "# SAFETY NOTE (design spec 6.1): under-listing a privileged perm bootloops",
+        "# a device under enforce; over-listing is harmless. genperms.py unions all",
+        "# pinned API tables <= the target API, so a perm privileged on any covered",
+        "# level stays grantable.",
+        "#",
+    ]
+    body = [f"{name}\t{level}" for name, level in sorted(table.items())]
+    return "\n".join(header + body) + "\n"
+
+
+def write_platform_perms_file(table: dict[str, str], api: int, out_path: Path) -> None:
+    """Write a generated platform-perms-<api>.txt to disk (ASCII)."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_platform_perms_file(table, api), encoding="ascii")
+
+
 def _read_perm_list_file(path: Path) -> set[str]:
-    """Read a perm-list text file: one name per line, '#' comments, blanks ok."""
+    """Read a perm-list text file: one name per line, '#' comments, blanks ok.
+
+    Used for the name-only requested-perms sidecars and the legacy --priv-file
+    test-injection path (a privileged subset by name, with no level column).
+    """
     perms: set[str] = set()
     for raw in path.read_text(encoding="ascii").splitlines():
         line = raw.strip()
@@ -318,12 +467,20 @@ def build_sysconfig_xml(packages: list[str]) -> str:
 
     <permissions>
       <allow-in-power-save package="..."/>
+      <allow-in-data-usage-save package="..."/>
       <allow-unthrottled-location package="..."/>
     </permissions>
+
+    These mirror the three entries microG ships in its canonical
+    sysconfig-com.google.android.gms.xml: allow-in-power-save (Doze exemption for
+    the persistent GCM/MCS connection), allow-in-data-usage-save (Data Saver
+    background-network exemption -- without it push is throttled under Data
+    Saver), and allow-unthrottled-location (location-request throttling exemption).
     """
     root = ET.Element("permissions")
     for pkg in packages:
         ET.SubElement(root, "allow-in-power-save", {"package": pkg})
+        ET.SubElement(root, "allow-in-data-usage-save", {"package": pkg})
         ET.SubElement(root, "allow-unthrottled-location", {"package": pkg})
     return _pretty_xml(root)
 
@@ -421,12 +578,38 @@ def _resolve_requested(args: argparse.Namespace) -> set[str]:
 
 
 def _resolve_privileged(args: argparse.Namespace) -> set[str]:
-    """Pick the privileged-perms source: --aosp-manifest, --priv-file, or data dir."""
+    """Pick the privileged-perms source for `gen`.
+
+    Precedence: --aosp-manifest (derive from a full manifest) > --priv-file (a
+    name-only privileged list, for test injection) > the data dir
+    (platform-perms-<api>.txt tables). The data-dir and manifest paths both yield
+    the authoritative privileged set; --priv-file is a deliberate test-only
+    shortcut that supplies privileged names directly without level data.
+    """
     if args.aosp_manifest:
         return privileged_perms_from_aosp_manifest(Path(args.aosp_manifest))
     if args.priv_file:
         return _read_perm_list_file(Path(args.priv_file))
     return load_privileged_perms(args.api, Path(args.data_dir))
+
+
+def cmd_extract_perms(args: argparse.Namespace) -> int:
+    """`extract-perms` subcommand: AOSP manifest -> platform-perms-<api>.txt.
+
+    Parses every <permission>/protectionLevel from a fetched AOSP core/res
+    AndroidManifest.xml and writes the sorted name<TAB>level table with the
+    documented header. This makes the checked-in data reproducible: the data
+    files are never hand-edited, only regenerated from a pinned AOSP tag.
+    """
+    table = platform_table_from_aosp_manifest(Path(args.aosp_manifest))
+    out_path = Path(args.out)
+    write_platform_perms_file(table, args.api, out_path)
+    priv = len(privileged_names(table))
+    print(
+        f"wrote {out_path}: {len(table)} platform perms "
+        f"({priv} privileged) for API {args.api}"
+    )
+    return 0
 
 
 def cmd_gen(args: argparse.Namespace) -> int:
@@ -504,7 +687,7 @@ def build_parser() -> argparse.ArgumentParser:
     priv.add_argument(
         "--data-dir",
         default=str(DEFAULT_DATA_DIR),
-        help="dir holding privileged-perms-<api>.txt (default: repo data/)",
+        help="dir holding platform-perms-<api>.txt (default: repo data/)",
     )
     priv.add_argument(
         "--priv-file", help="explicit privileged-perms list file (overrides data dir)"
@@ -550,6 +733,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", required=True, help="output sidecar path (e.g. <name>.perms)"
     )
     dump.set_defaults(func=cmd_dump_requested)
+
+    extract = sub.add_parser(
+        "extract-perms",
+        help="parse an AOSP manifest into a platform-perms-<api>.txt table",
+    )
+    extract.add_argument(
+        "--aosp-manifest",
+        required=True,
+        help="AOSP core/res AndroidManifest.xml to extract every <permission> from",
+    )
+    extract.add_argument(
+        "--api", type=int, required=True, help="API level this manifest is for"
+    )
+    extract.add_argument(
+        "--out", required=True, help="output data file (data/platform-perms-<api>.txt)"
+    )
+    extract.set_defaults(func=cmd_extract_perms)
     return parser
 
 
