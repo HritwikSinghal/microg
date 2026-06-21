@@ -1,0 +1,12 @@
+# Build output
+/build/
+/dist/
+*.zip
+
+# Downloaded, SHA-pinned APKs are fetched at build time, never committed
+/apks/*.apk
+/apks/*.jar
+
+# Editor / OS
+*.swp
+.DS_Store
