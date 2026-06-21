@@ -106,3 +106,45 @@ url                = ""  # Phase 2: no stable redistributable URL; bump skips th
 sha256             = "PENDING-BUMP"
 signer_cert_sha256 = "TODO-phase2"
 conflicts          = ["FakeStore"]
+
+# Google Contacts Sync Adapter -- GOOGLE-SIGNED proprietary (DIFFERENT cert from
+# microG; it carries the Google release-signing cert, not the microG cert above).
+# Installs as a NORMAL system app (system/app, NOT priv-app): it requests only
+# normal/runtime perms through the account + sync (SyncAdapter/AccountManager)
+# framework, so it needs NO privapp-permissions allowlist entry. NOTE: the schema
+# has no app-vs-priv-app placement column yet (type=app => priv-app in
+# common/place.sh); see report -- a non-priv-app placement is a follow-up. Harmless
+# while deferred: an empty url means components.conf/place never touch it.
+# DEFERRED: url = "" -> tools/bump and components.conf both skip it.
+[[apk]]
+name               = "GoogleContactsSyncAdapter"
+package            = "com.google.android.syncadapters.contacts"
+type               = "app"
+partition          = "product"
+version_code       = 0
+source             = "github"
+url                = ""  # deferred: pending a trustworthy pinned source; bump skips this
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "TODO-google-signed"
+conflicts          = []
+
+# Google Calendar Sync Adapter -- GOOGLE-SIGNED proprietary (DIFFERENT cert from
+# microG; it carries the Google release-signing cert, not the microG cert above).
+# Installs as a NORMAL system app (system/app, NOT priv-app): it requests only
+# normal/runtime perms through the account + sync (SyncAdapter/AccountManager)
+# framework, so it needs NO privapp-permissions allowlist entry. NOTE: the schema
+# has no app-vs-priv-app placement column yet (type=app => priv-app in
+# common/place.sh); see report -- a non-priv-app placement is a follow-up. Harmless
+# while deferred: an empty url means components.conf/place never touch it.
+# DEFERRED: url = "" -> tools/bump and components.conf both skip it.
+[[apk]]
+name               = "GoogleCalendarSyncAdapter"
+package            = "com.google.android.syncadapters.calendar"
+type               = "app"
+partition          = "product"
+version_code       = 0
+source             = "github"
+url                = ""  # deferred: pending a trustworthy pinned source; bump skips this
+sha256             = "PENDING-BUMP"
+signer_cert_sha256 = "TODO-google-signed"
+conflicts          = []
