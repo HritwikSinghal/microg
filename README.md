@@ -13,11 +13,16 @@ microG, CalyxOS, /e/OS) or by a separate add-on, and is covered by a standalone
 guide (see [Roadmap](#roadmap), Phase 5). The ZIP runs correctly in a
 Zygisk-enabled environment but bundles no spoofing engine of its own.
 
-> **Status: pre-alpha.** Phase 0 (the build system, CI, and host-tested
-> foundations) is complete. The on-device install logic (`customize.sh` and the
-> placement/cleanup scripts) is **Phase 1 and not yet implemented**, so the
-> produced ZIP is **not flashable yet**. Track progress in
-> [`claude/progress.md`](claude/progress.md). The authoritative design is
+> **Status: pre-alpha.** Phases 0-2 are code-complete and host-tested: the build
+> system + CI invariant (Phase 0), the on-device installer -- `customize.sh`
+> interpreter, overlay placer, API-matched permission selection, declarative
+> stock-GMS removal, boot-gated self-check (Phase 1) -- and the framework
+> (MapsV1) path + FakeStore/Phonesky mutual exclusion (Phase 2). 96 BATS tests
+> and 31 Python tests pass; shellcheck is clean. **Not yet verified on a real
+> device, and no release is published yet:** the produced ZIP only becomes
+> publishable after a `bump` pins real APK hashes (see [Building](#building)).
+> Track progress in [`claude/progress.md`](claude/progress.md). The authoritative
+> design is
 > [`docs/superpowers/specs/2026-06-20-microg-zygisk-installer-design.md`](docs/superpowers/specs/2026-06-20-microg-zygisk-installer-design.md).
 
 ## Why another installer
@@ -65,8 +70,9 @@ mismatched privileged-app permission XMLs**.
 ```
 module.prop                 # Magisk/KSU/APatch module metadata
 META-INF/.../update-binary  # vendored topjohnwu module installer + #MAGISK
-customize.sh                # install-time interpreter over components.conf (Phase 1)
-common/                     # detect.sh, log.sh (and place/perms/cleanup in Phase 1)
+customize.sh                # install-time interpreter over components.conf
+post-fs-data.sh service.sh  # early-boot stock-GMS removal; boot-gated self-check
+common/                     # detect.sh, log.sh, place.sh, perms.sh, cleanup.sh
 manifest.toml               # build-time source of truth (urls, hashes, signer certs)
 components.conf             # slim install-time table, GENERATED from manifest.toml
 lib/                        # build tooling: manifest.py, fetch.sh, genperms.py, invariant.py
@@ -105,13 +111,14 @@ build refuses to run -- by design.
 
 ## Installing
 
-> Not functional yet -- this lands in Phase 1.
+> The install logic is implemented (Phases 1-2) but not yet device-verified, and
+> a flashable ZIP is only produced after a `bump` pins real APK hashes.
 
-Once implemented, flash `out/microg-installer-*.zip` like any module: in the
-Magisk / KernelSU / APatch app (Modules -> Install from storage), then reboot.
-A boot-time self-check is written to
-`/data/adb/microg_installer/selfcheck.log` to turn "it bootlooped" into an
-actionable diagnosis.
+Once a build is published, flash `out/microg-installer-*.zip` like any module: in
+the Magisk / KernelSU / APatch app (Modules -> Install from storage), then reboot.
+A boot-time self-check is written to `/data/adb/microg_installer/selfcheck.log`
+(detected environment, what was placed, and a final OK/PROBLEM verdict) to turn
+"it bootlooped" into an actionable diagnosis.
 
 ## Development and CI
 
@@ -132,7 +139,10 @@ host (no device, no network).
 - **Phase 1** -- Module-only installer (Magisk + KSU + APatch): the
   `components.conf` interpreter, overlay placer, API-matched permission
   selection, declarative stock-GMS removal, boot-gated self-check.
+  *(code-complete, host-tested; not yet device-verified)*
 - **Phase 2** -- Phonesky variant + the MapsV1 framework path.
+  *(code-complete, host-tested; Phonesky is user-supplied -- see
+  [`docs/phonesky-sourcing.md`](docs/phonesky-sourcing.md))*
 - **Phase 3** -- System-mode / direct-partition placement (free-space, A/B,
   dynamic partitions, addon.d OTA survival).
 - **Phase 4** (stretch) -- Recovery flashing (ZIP signing, `/mnt/system`).

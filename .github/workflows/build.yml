@@ -35,7 +35,12 @@ jobs:
             lib/fetch.sh \
             common/detect.sh \
             common/log.sh \
+            common/place.sh \
+            common/perms.sh \
+            common/cleanup.sh \
             customize.sh \
+            post-fs-data.sh \
+            service.sh \
             META-INF/com/google/android/update-binary \
             test/fixtures/fake-getprop.sh
 
