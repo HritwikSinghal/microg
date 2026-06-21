@@ -131,9 +131,13 @@ _first_declared_partition() {
 		case "$_l" in
 		'' | '#'*) continue ;;
 		esac
-		# shellcheck disable=SC2086
 		# Intentional word-splitting: read the 4th whitespace-delimited field.
+		# `set -f` disables pathname expansion so a field with a glob
+		# metacharacter (* ? [) is not expanded against the CWD.
+		set -f
+		# shellcheck disable=SC2086
 		set -- $_l
+		set +f
 		if [ "$#" -ge 4 ]; then
 			printf '%s' "$4"
 		fi
@@ -268,9 +272,13 @@ while IFS= read -r line || [ -n "$line" ]; do
 	esac
 
 	# Parse the 7 fixed columns: name pkg asset partition type perms conflicts.
-	# Intentional word-splitting of the whitespace-delimited row.
+	# Intentional word-splitting of the whitespace-delimited row; `set -f`
+	# disables pathname expansion so a field with a glob metacharacter
+	# (* ? [) is not expanded against the CWD.
+	set -f
 	# shellcheck disable=SC2086
 	set -- $line
+	set +f
 	if [ "$#" -lt 7 ]; then
 		log_error "malformed components.conf row (expected 7 fields, got $#): $line"
 		PROBLEMS=$((PROBLEMS + 1))

@@ -55,14 +55,28 @@ jobs:
           old=/tmp/old-manifest.toml
           rm -f "$old"
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            # Compare against the tip of the PR's target branch. The fetch is
-            # guarded so a transient fetch failure degrades to a graceful skip
-            # (logged below) rather than aborting the step under `set -e`.
-            git fetch --no-tags --depth=1 origin "$BASE_REF" || true
-            if git show "origin/${BASE_REF}:manifest.toml" > "$old" 2>/dev/null; then
-              base_desc="PR base origin/${BASE_REF}"
+            # On a PR the base manifest ALWAYS exists, so an inability to obtain
+            # it is a hard failure, never a skip -- otherwise a flaky fetch would
+            # silently bypass the gate (the exact threat it exists to stop). We
+            # diff against the merge-base (where the PR forked), not the moving
+            # tip of the target branch, so an unrelated cert change landed on the
+            # base branch after fork does not produce a false positive.
+            if ! git fetch --no-tags origin "$BASE_REF"; then
+              echo "::error::could not fetch PR base origin/${BASE_REF} -- refusing to skip the signer-cert gate"
+              exit 1
+            fi
+            base_rev="$(git merge-base "origin/${BASE_REF}" HEAD)" || {
+              echo "::error::could not compute merge-base with origin/${BASE_REF} -- refusing to skip the signer-cert gate"
+              exit 1
+            }
+            if git show "${base_rev}:manifest.toml" > "$old" 2>/dev/null; then
+              base_desc="merge-base ${base_rev}"
             else
+              # manifest.toml did not exist at the fork point: genuinely a new
+              # file, so there is no prior cert to compare against.
               rm -f "$old"
+              echo "::notice::manifest.toml absent at merge-base ${base_rev} -- new file, skipping signer-cert gate"
+              exit 0
             fi
           else
             # push / tag / workflow_dispatch: compare against the parent commit,
@@ -75,7 +89,7 @@ jobs:
             fi
           fi
           if [ ! -f "$old" ]; then
-            echo "::notice::no base manifest.toml to diff against (first commit or file did not exist in base) -- skipping signer-cert gate"
+            echo "::notice::no base manifest.toml to diff against (first commit, no parent) -- skipping signer-cert gate"
             exit 0
           fi
           echo "signer-cert gate: comparing ${base_desc} against working tree manifest.toml"
@@ -151,7 +165,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
         if: steps.pins.outputs.bumped == 'true'
 
       - name: Install Android build-tools
