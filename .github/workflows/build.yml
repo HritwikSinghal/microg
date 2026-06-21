@@ -1,8 +1,12 @@
 name: build
 
-# Hermetic build + host checks + (on tags) publish a GitHub Release.
+# Hermetic build + host checks + signer-cert security gate + (on tags) publish
+# a GitHub Release.
 # RESOLVE (tools/bump) is intentionally NOT here -- it is the only
 # network-trusting step and runs in bump.yml so this workflow stays hermetic.
+# The `checks` job runs the signer-cert gate (lib/invariant.py check-signer)
+# against the diff base, so a PR or hand-edit that swaps in an attacker cert
+# fails here, not just on the bump path.
 
 on:
   push:
@@ -11,19 +15,71 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: the default token is read-only. Only the `release` job
+# elevates to contents:write (via its own job-level permissions block), so the
+# jobs that execute repo code (checks/build) never get a write-capable token --
+# important because this workflow also runs on same-repo pull_request events.
 permissions:
-  contents: write   # the release job needs to create releases on tag pushes
+  contents: read
 
 jobs:
   # Host-side checks (design spec section 8). Fast, no Android SDK, no network.
   checks:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the signer-cert gate can diff manifest.toml against the
+      # PR base (push events) or the parent commit (master pushes). A shallow
+      # clone would not have HEAD^ / the base ref available.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      # Security gate: a signer_cert_sha256 change is a security event, never a
+      # version bump (design spec 6.2). The bump workflow already enforces this,
+      # but a PR or hand-edit straight to master bypasses bump entirely -- so we
+      # also enforce it here. Without this, an attacker-controlled cert (with a
+      # matching APK) would install as a privileged system app. The base manifest
+      # is extracted into /tmp and compared via the shared CLI; a changed cert
+      # exits non-zero and fails the build.
+      - name: Signer-cert gate (diff manifest.toml against the base)
+        env:
+          # GitHub-provided refs; quoted into env to avoid any shell injection.
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          old=/tmp/old-manifest.toml
+          rm -f "$old"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Compare against the tip of the PR's target branch. The fetch is
+            # guarded so a transient fetch failure degrades to a graceful skip
+            # (logged below) rather than aborting the step under `set -e`.
+            git fetch --no-tags --depth=1 origin "$BASE_REF" || true
+            if git show "origin/${BASE_REF}:manifest.toml" > "$old" 2>/dev/null; then
+              base_desc="PR base origin/${BASE_REF}"
+            else
+              rm -f "$old"
+            fi
+          else
+            # push / tag / workflow_dispatch: compare against the parent commit,
+            # tolerating the very first commit (no parent).
+            if git rev-parse --verify --quiet HEAD^ >/dev/null \
+               && git show 'HEAD^:manifest.toml' > "$old" 2>/dev/null; then
+              base_desc="parent commit HEAD^"
+            else
+              rm -f "$old"
+            fi
+          fi
+          if [ ! -f "$old" ]; then
+            echo "::notice::no base manifest.toml to diff against (first commit or file did not exist in base) -- skipping signer-cert gate"
+            exit 0
+          fi
+          echo "signer-cert gate: comparing ${base_desc} against working tree manifest.toml"
+          python3 lib/invariant.py check-signer --old "$old" --new manifest.toml
 
       - name: Install host tools
         run: sudo apt-get update && sudo apt-get install -y shellcheck bats libxml2-utils
@@ -127,6 +183,10 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') && needs.build.outputs.bumped == 'true'
     runs-on: ubuntu-latest
+    # Only this job needs write access (to create the Release); the top-level
+    # default is read-only. This runs only on tag pushes, never on PRs.
+    permissions:
+      contents: write
     steps:
       # Full history so the changelog can diff against the previous tag, and so
       # module.prop (the version/versionCode source of truth) is available.
@@ -154,19 +214,27 @@ jobs:
           version_code="$(sed -n 's/^versionCode=//p' module.prop | head -n1)"
           case "$version_code" in ''|*[!0-9]*) echo "module.prop versionCode is not numeric: '$version_code'" >&2; exit 1 ;; esac
           # The module (systemless) zip is the manager-installed artifact that
-          # auto-update targets. Today build.sh emits one zip; when a system-mode
-          # zip is added (Phase 3) select the module one explicitly here.
-          zip_name="$(cd out && ls -1 ./*.zip | sed 's#^\./##' | head -n1)"
+          # auto-update targets. Today build.sh emits exactly one zip; assert that
+          # so we never silently pick one of several. When a system-mode zip is
+          # added (Phase 3) select the module one explicitly here instead.
+          shopt -s nullglob
+          zips=(out/*.zip)
+          if [ "${#zips[@]}" -ne 1 ]; then
+            echo "expected exactly one out/*.zip, found ${#zips[@]}: ${zips[*]:-<none>}" >&2
+            exit 1
+          fi
+          zip_name="$(basename "${zips[0]}")"
           base="https://github.com/${REPO}/releases"
 
-          cat > out/update.json <<EOF
-          {
-            "version": "${version}",
-            "versionCode": ${version_code},
-            "zipUrl": "${base}/download/${TAG}/${zip_name}",
-            "changelog": "${base}/latest/download/changelog.md"
-          }
-          EOF
+          # Build update.json with jq so all values are correctly JSON-escaped
+          # (version/zip_name come from files, not literals).
+          jq -n \
+            --arg version "$version" \
+            --argjson versionCode "$version_code" \
+            --arg zipUrl "${base}/download/${TAG}/${zip_name}" \
+            --arg changelog "${base}/latest/download/changelog.md" \
+            '{version: $version, versionCode: $versionCode, zipUrl: $zipUrl, changelog: $changelog}' \
+            > out/update.json
 
           prev="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
           {
@@ -183,10 +251,14 @@ jobs:
           echo "--- changelog.md ---"; cat out/changelog.md
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        # SHA-pinned for supply-chain safety (privileged contents:write job).
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             out/*.zip
             out/update.json
             out/changelog.md
+          # Fail loudly if any `files` glob matches nothing -- otherwise a missing
+          # zip would silently publish an update feed pointing at a 404.
+          fail_on_unmatched_files: true
           generate_release_notes: true
