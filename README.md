@@ -9,9 +9,18 @@ system apps on stock Android, working across **Magisk**, **KernelSU**, and
 
 The installer deliberately ships **no signature spoofing**. Spoofing is the
 genuinely ROM-specific part; it is provided by your ROM (e.g. LineageOS for
-microG, CalyxOS, /e/OS) or by a separate add-on, and is covered by a standalone
-guide (see [Roadmap](#roadmap), Phase 5). The ZIP runs correctly in a
+microG, CalyxOS, /e/OS) or by a separate add-on. The ZIP runs correctly in a
 Zygisk-enabled environment but bundles no spoofing engine of its own.
+
+> **Prerequisite: signature spoofing.** microG officially requires
+> framework-level signature spoofing to be useful. Without it microG installs
+> cleanly, but most Google-API apps reject it because they verify they are
+> talking to the genuinely-signed `com.google.android.gms`. This installer does
+> not provide spoofing by design (it is ROM-specific and there is no official
+> Zygisk module for it) -- you must supply it via a microG-aware ROM or an
+> LSPosed/FakeGApps add-on, then confirm it via microG Settings -> Self-Check.
+> See [`docs/signature-spoofing.md`](docs/signature-spoofing.md) for the full
+> guide.
 
 > **Status: pre-alpha.** Phases 0-2 are code-complete and host-tested: the build
 > system + CI invariant (Phase 0), the on-device installer -- `customize.sh`
@@ -153,7 +162,8 @@ host (no device, no network).
 - **Phase 3** -- System-mode / direct-partition placement (free-space, A/B,
   dynamic partitions, addon.d OTA survival).
 - **Phase 4** (stretch) -- Recovery flashing (ZIP signing, `/mnt/system`).
-- **Phase 5** -- Signature-spoofing guide (standalone; can start anytime).
+- **Phase 5** -- Signature-spoofing guide (standalone). *(written -- see
+  [`docs/signature-spoofing.md`](docs/signature-spoofing.md))*
 
 ## License
 

@@ -1,6 +1,6 @@
 # microG Universal Installer -- Progress
 
-Last updated: 2026-06-21 | Session: 5
+Last updated: 2026-06-21 | Session: 6
 
 ## Phase 1 Handoff
 
@@ -104,10 +104,25 @@ Key principles:
 - [ ] /mnt/system mounting + Android-14 free-space workaround
 
 ### Phase 5 -- Signature-spoofing guide (parallel; can start anytime)
-- [ ] Patched-ROM detection + which ROMs already spoof
+- [x] Prerequisite + options guide written -- docs/signature-spoofing.md (Session 6):
+      why spoofing is required; why we bundle none; options (microG-aware ROM /
+      FakeGApps via LSPosed with Android-15 caveat / apksigcopier as external prior
+      art only); Self-Check verification; Nov-2024 Google checker-change note;
+      README prerequisite callout. Covers the survey level of the items below.
+- [ ] Patched-ROM detection + which ROMs already spoof (deeper per-route detail)
 - [ ] LSPosed + FakeGApps route (fork selection, Zygisk impl per root manager)
 - [ ] Native Zygisk spoofing options survey
 - [ ] Verification + pitfalls (no GMS coexistence, activation, DenyList/Shamiko)
+
+### Post-v0.1.0 hardening + add-ons (Session 6) -- next-agent backlog
+- [ ] VALIDATE Session 6 unrun work: run pytest + BATS + a build (Session 6 skipped
+      tests/builds per user directive). Perms refactor + new guard need a green run.
+- [ ] Component comparison matrix doc: rewrite docs/temp.md (raw, non-ASCII) into a
+      clean ASCII docs/comparison.md, link from README, then remove temp.md.
+- [ ] common/place.sh: add a system/app (non-priv-app) placement path + a
+      components.conf placement-location column -- prerequisite for sync adapters.
+- [ ] Bump the two deferred sync adapters (Google-signed; network step + user).
+- [ ] Re-tag / re-cut a release including the Session 6 hardening.
 
 ## Release Milestones
 
@@ -197,3 +212,31 @@ the user's to run (per directive: agent does not build/test/flash).
   19 (detect.bats) + 9 (log.bats) = 28 BATS, plus 31 pytest (genperms_test.py) = 59
   host tests total. Confirmed common/place.sh|perms.sh|cleanup.sh and root
   post-fs-data.sh|service.sh do NOT exist yet -- they are Phase 1 deliverables.
+- 2026-06-21 (Session 6): Two repo-wide bug hunts (4 parallel finders each) +
+  fixes, then a requirements-hardening pass. Bug fixes (commits 2cfd2e4, 250d166,
+  24f4b86, 689ad99): overlay set_perm/SELinux normalization (was absent),
+  post-fs-data partition mis-iteration, multi-signer cert check, framework-asset
+  validation, vendored-path traversal guard, deterministic ZIP, bump fatal
+  field-write + downgrade guard + atomic write + shared _norm_cert, signer-cert
+  gate enforced on every CI path, SHA-pinned third-party actions, least-privilege
+  tokens. The second hunt caught a regression in my own signer-gate fix (it
+  degraded to a silent PASS on the PR path when the base manifest could not be
+  fetched) -- fixed to fail closed + diff against merge-base, plus set -f noglob on
+  the component-row splits (commit 1d0a251). THEN requirements hardening vs the
+  official microG needs + a survey of micro5k/MinMicroG/NanoDroid/nift4/
+  Lineage4microG: (a) bootloop-proofed the allowlist -- replaced the hand-curated
+  privileged lists with AOSP-derived data/platform-perms-{30,33,34,35}.txt (full
+  perm+protectionLevel tables, pinned tags) and added a FAIL-CLOSED unknown-perm
+  guard in invariant.py, since the old design silently dropped any requested perm
+  not in the curated set and the invariant judged "privileged?" with the same
+  incomplete set (commit 5d320c7); added CHANGE_DEVICE_IDLE_TEMP_WHITELIST +
+  allow-in-data-usage-save (canonical microG parity). (b) Added two DEFERRED
+  Google-signed sync adapters to manifest.toml (commit 3563308). (c) Wrote the
+  spoofing prerequisite guide (commit 0fa9f45). Decisions made with the user:
+  derive privileged set from AOSP manifest (in scope), sync adapters IN /
+  F-Droid Priv-Extension OUT, apksigcopier no-sigspoof route DEFERRED, location
+  backends/DroidGuard/Aurora OUT (non-gaps: folded into modern GmsCore). Sessions
+  6 work was committed but NOT test/build-validated (user directive to save tokens
+  + run validation themselves) -- the next agent must validate first (see backlog
+  + claude/next-session-prompt.md). Finding: the place.sh priv-app-only placement
+  blocks un-deferring the sync adapters (they are system/app).
