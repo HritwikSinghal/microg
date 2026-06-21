@@ -228,3 +228,43 @@ _stage_asset() {
 	grep -q "\[WARN\] declared partition 'system' not detected" \
 		"$MICROG_LOG_DIR/selfcheck.log"
 }
+
+# --------------------------------------------------------------------------
+# Fix #4: defense-in-depth -- an empty name or partition must never let the
+# rm -rf collapse onto a parent dir and wipe sibling components.
+# --------------------------------------------------------------------------
+
+@test "place_app refuses an empty name and does not touch the overlay" {
+	# Pre-seed a sibling so we can prove it is NOT deleted by a bad call.
+	mkdir -p "$MODPATH/system/product/priv-app/Sibling"
+	: >"$MODPATH/system/product/priv-app/Sibling/keep"
+	_stage_asset "apks/GmsCore.apk" "BODY"
+	run place_app "" "apks/GmsCore.apk" "product"
+	[ "$status" -ne 0 ]
+	# The whole priv-app dir (and the sibling) must still be intact.
+	[ -e "$MODPATH/system/product/priv-app/Sibling/keep" ]
+}
+
+@test "place_app refuses an empty partition" {
+	_stage_asset "apks/GmsCore.apk" "BODY"
+	run place_app "GmsCore" "apks/GmsCore.apk" ""
+	[ "$status" -ne 0 ]
+	grep -q '\[ERROR\] place_app: refusing' "$MICROG_LOG_DIR/selfcheck.log"
+}
+
+@test "place_remove refuses an empty name and leaves siblings intact" {
+	mkdir -p "$MODPATH/system/product/priv-app/Sibling"
+	: >"$MODPATH/system/product/priv-app/Sibling/keep"
+	run place_remove "" "product"
+	# A guarded no-op (returns 0) -- but it must NOT have wiped the priv-app dir.
+	[ "$status" -eq 0 ]
+	[ -e "$MODPATH/system/product/priv-app/Sibling/keep" ]
+}
+
+@test "place_remove refuses an empty partition" {
+	mkdir -p "$MODPATH/system/product/priv-app/FakeStore"
+	run place_remove "FakeStore" ""
+	[ "$status" -eq 0 ]
+	# Nothing under product touched (the guard fired before computing the path).
+	[ -d "$MODPATH/system/product/priv-app/FakeStore" ]
+}

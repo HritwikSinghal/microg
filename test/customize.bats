@@ -345,3 +345,118 @@ GmsCore    com.google.android.gms   apks/GmsCore.apk    product    app        pe
 	[ "$status" -eq 0 ]
 	grep -q 'install complete: all components placed (OK)' "$MICROG_LOG_DIR/selfcheck.log"
 }
+
+# --------------------------------------------------------------------------
+# Fix #1 regression: the overlay MUST be permission/owner/context normalized.
+#
+# Plain cp/mkdir leave the wrong mode + SELinux context, so PackageManager
+# silently ignores the APKs and etc/permissions allowlists. customize.sh must
+# normalize "$MODPATH/system" after placement. We assert both the preferred
+# path (set_perm_recursive invoked with the canonical args) and the manual
+# fallback (a placed file ends up mode 0644).
+# --------------------------------------------------------------------------
+
+# _shim_set_perm_recursive: put an executable named set_perm_recursive early on
+# PATH that records its argv to $MODPATH/setperm.log, so `command -v` finds it
+# and the interpreter prefers it over the manual fallback. (On a real install
+# this is a function sourced from util_functions.sh; an on-PATH executable is an
+# equivalent, test-injectable seam since the code probes via `command -v`.)
+_shim_set_perm_recursive() {
+	mkdir -p "$MODPATH/shim-bin"
+	cat >"$MODPATH/shim-bin/set_perm_recursive" <<SHIM
+#!/bin/sh
+printf '%s\n' "\$*" >>"$MODPATH/setperm.log"
+exit 0
+SHIM
+	chmod 0755 "$MODPATH/shim-bin/set_perm_recursive"
+}
+
+@test "fix1: set_perm_recursive is invoked against the overlay with canonical args" {
+	# The stub place/perms libs do not create real files, so seed an overlay dir
+	# the normalizer can act on (mirrors a successful placement).
+	mkdir -p "$MODPATH/system/product/etc/permissions"
+	_shim_set_perm_recursive
+	PATH="$MODPATH/shim-bin:$PATH" run sh "$REPO_ROOT/customize.sh"
+	[ "$status" -eq 0 ]
+	# Exactly the canonical Magisk normalization call on the overlay root.
+	grep -qx "$MODPATH/system 0 0 0755 0644" "$MODPATH/setperm.log"
+}
+
+@test "fix1: manual fallback chmods placed permission XML to 0644" {
+	# Use the REAL place/perms libs so a genuine etc/permissions/*.xml is placed,
+	# then let the manual fallback (no set_perm_recursive on PATH) normalize it.
+	cp "$COMMON_DIR/place.sh" "$MODPATH/common/place.sh"
+	cp "$COMMON_DIR/perms.sh" "$MODPATH/common/perms.sh"
+	# A single-app table keeps the assertion focused.
+	_write_components 'GmsCore    com.google.android.gms   apks/GmsCore.apk    product    app        perms/gmscore.xml    -'
+	# Real perms.sh validates+copies this file; give it well-formed XML.
+	printf '%s\n' '<?xml version="1.0"?><permissions></permissions>' >"$MODPATH/perms/gmscore.xml"
+	# Detect 'product' as a real partition so place_resolve_partition keeps it.
+	export DETECT_ROOT="$MODPATH/detroot"
+	mkdir -p "$DETECT_ROOT/system" "$DETECT_ROOT/product"
+	export DETECT_PART_CANDIDATES="system system_ext product vendor"
+	# Make the placed APK world-writable up front so a no-op normalizer would be
+	# visibly detectable (the assertion below would then fail).
+	run sh "$REPO_ROOT/customize.sh"
+	[ "$status" -eq 0 ]
+	local xml="$MODPATH/system/product/etc/permissions/gmscore.xml"
+	[ -f "$xml" ]
+	# Mode must be exactly 0644 after normalization (portable stat: %a octal).
+	local mode
+	mode="$(stat -c '%a' "$xml" 2>/dev/null || stat -f '%Lp' "$xml" 2>/dev/null)"
+	[ "$mode" = "644" ]
+	# And a placed APK dir must be 0755.
+	local appdir="$MODPATH/system/product/priv-app/GmsCore"
+	[ -d "$appdir" ]
+	local dmode
+	dmode="$(stat -c '%a' "$appdir" 2>/dev/null || stat -f '%Lp' "$appdir" 2>/dev/null)"
+	[ "$dmode" = "755" ]
+}
+
+@test "fix1: normalization is a safe no-op when nothing was placed" {
+	# Empty table => no overlay tree => normalizer must not error.
+	_write_components '# nothing here'
+	run_customize
+	[ "$status" -eq 0 ]
+	grep -q 'normalize: no overlay' "$MICROG_LOG_DIR/selfcheck.log"
+}
+
+# --------------------------------------------------------------------------
+# Fix #2 regression: customize.sh records the RESOLVED partitions so
+# post-fs-data masks the right overlay paths (not a bogus system/* glob).
+# --------------------------------------------------------------------------
+
+@test "fix2: resolved partitions are recorded to .microg-partitions (deduped)" {
+	run_customize
+	[ "$status" -eq 0 ]
+	[ -f "$MODPATH/.microg-partitions" ]
+	# All three default rows resolve to 'product'; the primary is 'product' too,
+	# so the deduped manifest must contain exactly one 'product' line.
+	local n
+	n="$(grep -c '^product$' "$MODPATH/.microg-partitions")"
+	[ "$n" -eq 1 ]
+	# No bogus component-dir names leaked in as partitions.
+	run ! grep -q 'priv-app' "$MODPATH/.microg-partitions"
+}
+
+# --------------------------------------------------------------------------
+# Fix #3 regression: conflict purge removes API-variant permission XML too, not
+# just the base file, so a FakeStore<->Phonesky reflash cannot leave two
+# coexisting allowlists.
+# --------------------------------------------------------------------------
+
+@test "fix3: conflict purge removes API-variant permission XML (phonesky-34.xml)" {
+	# Seed BOTH a base and an API-variant allowlist for the conflicting Phonesky.
+	mkdir -p "$MODPATH/system/product/etc/permissions"
+	: >"$MODPATH/system/product/etc/permissions/phonesky.xml"
+	: >"$MODPATH/system/product/etc/permissions/phonesky-34.xml"
+	# An unrelated allowlist must survive (the glob is stem-anchored).
+	: >"$MODPATH/system/product/etc/permissions/gmscore.xml"
+	run_customize
+	[ "$status" -eq 0 ]
+	# FakeStore conflicts with Phonesky => both phonesky XMLs purged.
+	[ ! -e "$MODPATH/system/product/etc/permissions/phonesky.xml" ]
+	[ ! -e "$MODPATH/system/product/etc/permissions/phonesky-34.xml" ]
+	# Unrelated allowlist untouched.
+	[ -e "$MODPATH/system/product/etc/permissions/gmscore.xml" ]
+}

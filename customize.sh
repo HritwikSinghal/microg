@@ -151,6 +151,45 @@ perms_place_sysconfig "$PRIMARY_PART" ||
 	{ log_error "sysconfig placement failed"; PROBLEMS=$((PROBLEMS + 1)); }
 
 # ---------------------------------------------------------------------------
+# Resolved-partition manifest for early-boot masking.
+#
+# post-fs-data.sh must mask stock GMS in exactly the partition(s) this install
+# placed microG into. It cannot reliably DERIVE those by globbing
+# "$MODDIR/system/*": for the default bare-`system` layout the children of
+# system/ are priv-app/etc/framework (component subdirs), NOT partition names,
+# so a glob would invent bogus partitions. Instead we record every RESOLVED
+# partition here (the same value place_resolve_partition returns and that
+# _place_overlay_root roots the overlay at) into a small newline-delimited file,
+# deduped, and post-fs-data.sh iterates that. The path stays in lockstep with
+# the overlay: partition P maps to "$MODDIR/system/P/...".
+# ---------------------------------------------------------------------------
+
+MICROG_PARTS_FILE="$MODDIR/.microg-partitions"
+# Start fresh each install so a stale partition from a prior flash cannot
+# linger and cause masking in a partition we no longer use. Truncate is
+# best-effort; a failure only degrades post-fs-data to its "system" fallback.
+: >"$MICROG_PARTS_FILE" 2>/dev/null || log_warn "could not create $MICROG_PARTS_FILE; early-boot masking will fall back to 'system'"
+
+# _record_partition PART: append PART to the manifest unless already present.
+# Deduped so repeated components in one partition yield a single line. Empty
+# input is ignored (a blank partition is never a real overlay target).
+_record_partition() {
+	_rp_part="$1"
+	[ -z "$_rp_part" ] && { unset _rp_part; return 0; }
+	[ -f "$MICROG_PARTS_FILE" ] || { unset _rp_part; return 0; }
+	# Whole-line match so "system" does not suppress "system_ext".
+	if ! grep -qxF "$_rp_part" "$MICROG_PARTS_FILE" 2>/dev/null; then
+		printf '%s\n' "$_rp_part" >>"$MICROG_PARTS_FILE" 2>/dev/null ||
+			log_warn "could not record partition '$_rp_part' to $MICROG_PARTS_FILE"
+	fi
+	unset _rp_part
+}
+
+# The sysconfig (and stock-GMS cleanup below) live in the primary partition, so
+# it must be masked too even if no component row resolves to it.
+_record_partition "$PRIMARY_PART"
+
+# ---------------------------------------------------------------------------
 # Conflict purge helper.
 #
 # For each comma-separated component name in a row's `conflicts` column (the
@@ -183,19 +222,35 @@ _purge_conflicts() {
 		# Remove the app/framework payload.
 		place_remove "$_pc_name" "$_pc_part" ||
 			log_warn "conflict purge: place_remove $_pc_name failed (continuing)"
-		# Remove its permission XML (lowercased-name convention).
+		# Remove its permission XML (lowercased-name convention). perms.sh names
+		# the placed file from the perms-ref basename stem, optionally with an
+		# "-<API>" suffix (e.g. phonesky.xml AND phonesky-34.xml). On a
+		# variant<->variant reflash (FakeStore<->Phonesky) the conflicting
+		# component may have landed as EITHER the base or an API variant, so we
+		# must purge both the base and every "<stem>-*.xml" variant -- removing
+		# only the base would leave a stale phonesky-34.xml allowlist coexisting
+		# with the newly placed component's allowlist.
 		_pc_lower="$(printf '%s' "$_pc_name" | tr '[:upper:]' '[:lower:]')"
-		_pc_xml="$MODDIR/system/$_pc_part/etc/permissions/$_pc_lower.xml"
-		if [ -e "$_pc_xml" ]; then
-			rm -f "$_pc_xml" 2>/dev/null ||
-				log_warn "conflict purge: could not remove $_pc_xml"
+		_pc_permdir="$MODDIR/system/$_pc_part/etc/permissions"
+		# Guard: never let an empty stem/part expand the glob to the whole
+		# permissions dir (or a parent) -- a blank conflict name must be a no-op,
+		# not an `rm` of unrelated allowlists.
+		if [ -n "$_pc_lower" ] && [ -n "$_pc_part" ] && [ -d "$_pc_permdir" ]; then
+			# Base file plus "-<API>" variants. The for-loop over a glob is the
+			# POSIX-safe way to handle "no match" (the literal pattern is then
+			# simply skipped by the -e test) without nullglob.
+			for _pc_xml in "$_pc_permdir/$_pc_lower.xml" "$_pc_permdir/$_pc_lower"-*.xml; do
+				[ -e "$_pc_xml" ] || continue
+				rm -f "$_pc_xml" 2>/dev/null ||
+					log_warn "conflict purge: could not remove $_pc_xml"
+			done
 		fi
-		unset _pc_lower _pc_xml
+		unset _pc_lower _pc_permdir _pc_xml
 		IFS=','
 	done
 	IFS="$_pc_oldifs"
 
-	unset _pc_conflicts _pc_part _pc_oldifs _pc_name
+	unset _pc_conflicts _pc_part _pc_oldifs _pc_name _pc_lower _pc_permdir _pc_xml
 	return 0
 }
 
@@ -232,6 +287,9 @@ while IFS= read -r line || [ -n "$line" ]; do
 	# Resolve the partition ONCE and pass the resolved value to both place_*
 	# and perms_* so the payload and its permission XML share a partition.
 	part="$(place_resolve_partition "$declared_part")"
+
+	# Record it for early-boot masking (post-fs-data reads this manifest).
+	_record_partition "$part"
 
 	# Purge declared conflicts before placing this component (atomic swap).
 	_purge_conflicts "$conflicts" "$part"
@@ -272,6 +330,80 @@ done <"$COMPONENTS_CONF"
 
 cleanup_stock_gms "$PRIMARY_PART" "$DEV_ENGINE" ||
 	{ log_warn "stock GMS cleanup reported a problem"; PROBLEMS=$((PROBLEMS + 1)); }
+
+# ---------------------------------------------------------------------------
+# Overlay permission/ownership/SELinux normalization (CRITICAL).
+#
+# Everything above lands files via plain `cp`/`mkdir`, which inherit the
+# installer's umask and an unpredictable SELinux context. Magisk does NOT
+# auto-normalize "$MODPATH/system" -- its own template explicitly calls
+# set_perm_recursive for exactly this reason. If the overlay keeps the wrong
+# mode/owner/context, PackageManager silently ignores the APKs and the
+# etc/permissions/*.xml allowlists, so microG never gets its privileged perms
+# (and service.sh's presence-only check would still report OK -- a silent
+# failure). We therefore normalize the whole overlay to the canonical Magisk
+# system layout: dirs 0755, files 0644, owner 0:0, context system_file.
+#
+# Preference order:
+#   1. set_perm_recursive (sourced from util_functions.sh during a BOOTMODE
+#      install). It is the canonical idiom and sets mode, owner AND context in
+#      one call. We probe for it via `command -v` so a context where it is
+#      absent (an unusual recovery, or a host test) does not error.
+#   2. A manual find-based fallback: chmod dirs/files, best-effort chown 0:0,
+#      and a chcon guarded by `command -v` (chcon is missing on some recoveries).
+#
+# Idempotent and safe when "$MODPATH/system" does not exist (nothing placed).
+# ---------------------------------------------------------------------------
+
+# _normalize_overlay: apply the canonical system perms/owner/context to the
+# whole module overlay. Returns 0 always (best-effort; a perms failure must not
+# abort the install -- it is surfaced via the log instead).
+_normalize_overlay() {
+	_no_root="$MODPATH/system"
+	if [ ! -d "$_no_root" ]; then
+		log_info "normalize: no overlay at $_no_root (nothing placed); skipping"
+		unset _no_root
+		return 0
+	fi
+
+	if command -v set_perm_recursive >/dev/null 2>&1; then
+		# Canonical Magisk call: dirs 0755, files 0644, owner 0:0; it applies the
+		# default system_file context too. Word-split is not a concern (fixed args).
+		if set_perm_recursive "$_no_root" 0 0 0755 0644; then
+			log_info "normalize: set_perm_recursive applied to $_no_root (0:0 0755/0644 +context)"
+		else
+			log_warn "normalize: set_perm_recursive reported a problem on $_no_root"
+		fi
+		unset _no_root
+		return 0
+	fi
+
+	# Fallback: set_perm_recursive unavailable. Apply the same end state by hand.
+	log_warn "normalize: set_perm_recursive unavailable; applying manual chmod/chown/chcon fallback"
+	# Directories 0755, files 0644. Two passes keep it portable (no find -perm
+	# arithmetic, no GNU-only predicates -- toybox find supports -type/-exec).
+	find "$_no_root" -type d -exec chmod 0755 {} + 2>/dev/null ||
+		log_warn "normalize: chmod 0755 on dirs failed (continuing)"
+	find "$_no_root" -type f -exec chmod 0644 {} + 2>/dev/null ||
+		log_warn "normalize: chmod 0644 on files failed (continuing)"
+	# Ownership must be root:root for PackageManager to trust a system app. On a
+	# real install we are root; on a host test chown will fail harmlessly.
+	chown -R 0:0 "$_no_root" 2>/dev/null ||
+		log_warn "normalize: chown 0:0 failed (expected off-device; continuing)"
+	# SELinux context: chcon is absent on some recoveries -- guard it. Use the
+	# same system_file context set_perm_recursive would apply.
+	if command -v chcon >/dev/null 2>&1; then
+		chcon -R u:object_r:system_file:s0 "$_no_root" 2>/dev/null ||
+			log_warn "normalize: chcon system_file failed (continuing)"
+	else
+		log_warn "normalize: chcon unavailable; SELinux context left as-is"
+	fi
+	log_info "normalize: manual fallback applied to $_no_root"
+	unset _no_root
+	return 0
+}
+
+_normalize_overlay
 
 # ---------------------------------------------------------------------------
 # Summary. We never abort the install for component problems; the boot-time

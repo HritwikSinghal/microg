@@ -248,3 +248,47 @@ load_service() {
 	[ "$status" -eq 0 ]
 	grep -q 'verdict OK' "$MICROG_LOG_DIR/selfcheck.log"
 }
+
+# --------------------------------------------------------------------------
+# Fix #2 regression: post-fs-data.sh masks the partitions recorded in the
+# manifest, NOT a bogus glob of "$MODDIR/system/*". The bare-`system` layout is
+# the trap -- there system/ holds component subdirs (priv-app, etc), so the old
+# glob masked into nonsense paths and missed the real stock GMS.
+# --------------------------------------------------------------------------
+
+# run_post_fs_data: execute the early-boot script with MODDIR pointed at our
+# mocked MODPATH and the real common/ libs linked in (mirrors load_service).
+run_post_fs_data() {
+	ln -snf "$COMMON_DIR" "$MODPATH/common"
+	MODDIR="$MODPATH" run sh "$REPO_ROOT/post-fs-data.sh"
+}
+
+@test "fix2: post-fs-data masks exactly the partition in the manifest" {
+	# Bare-system layout: the overlay's system/ holds component subdirs, and the
+	# manifest declares the single real partition 'system'.
+	mkdir -p "$MODPATH/system/system/priv-app/GmsCore"
+	printf 'system\n' >"$MODPATH/.microg-partitions"
+
+	run_post_fs_data
+	[ "$status" -eq 0 ]
+	# Stock GMS masked under system/system/... (the real partition path).
+	[ -f "$MODPATH/system/system/priv-app/GmsCore/.replace" ]
+	# And NOT into a bogus partition named after a component subdir.
+	[ ! -e "$MODPATH/system/priv-app/priv-app/GmsCore/.replace" ]
+}
+
+@test "fix2: post-fs-data masks every manifest partition (multi-partition)" {
+	printf 'system\nproduct\n' >"$MODPATH/.microg-partitions"
+	run_post_fs_data
+	[ "$status" -eq 0 ]
+	[ -f "$MODPATH/system/system/priv-app/GmsCore/.replace" ]
+	[ -f "$MODPATH/system/product/priv-app/GmsCore/.replace" ]
+}
+
+@test "fix2: post-fs-data falls back to 'system' when the manifest is missing" {
+	# No .microg-partitions file at all (old/partial install).
+	run_post_fs_data
+	[ "$status" -eq 0 ]
+	grep -q 'falling back to' "$MICROG_LOG_DIR/selfcheck.log"
+	[ -f "$MODPATH/system/system/priv-app/GmsCore/.replace" ]
+}

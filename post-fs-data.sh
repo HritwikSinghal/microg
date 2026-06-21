@@ -39,21 +39,33 @@ log_info "post-fs-data: early-boot stock-GMS masking (FBE-safe; /data/data untou
 engine="$(detect_mount_engine)"
 
 # Mask stock GMS/Play across every partition the module overlay actually
-# targets, so we cover whatever partition customize.sh placed microG into. We
-# look at the overlay tree under "$MODDIR/system" rather than the live system,
-# keeping all work inside the module and off real partitions.
+# targets. We read the partition manifest customize.sh wrote
+# ("$MODDIR/.microg-partitions", one RESOLVED partition name per line) rather
+# than globbing "$MODDIR/system/*". The glob is WRONG for the default bare-
+# `system` layout: there the children of system/ are component subdirs
+# (priv-app, etc, framework), not partition names, so globbing would spray
+# bogus sentinels into nonsense paths (system/priv-app/priv-app/...) and never
+# mask the real stock GMS. The manifest is the single source of truth and maps
+# 1:1 to the overlay path cleanup_stock_gms writes ("$MODDIR/system/<part>/...").
 masked_any=0
-if [ -d "$MODDIR/system" ]; then
-	for partdir in "$MODDIR"/system/*; do
-		[ -d "$partdir" ] || continue
-		part="${partdir##*/}"
+parts_file="$MODDIR/.microg-partitions"
+if [ -f "$parts_file" ]; then
+	# `|| [ -n "$part" ]` handles a final line with no trailing newline.
+	while IFS= read -r part || [ -n "$part" ]; do
+		# Skip blank lines defensively (a truncated write must never expand to an
+		# empty partition, which cleanup_stock_gms treats as a no-op anyway).
+		[ -z "$part" ] && continue
 		cleanup_stock_gms "$part" "$engine"
 		masked_any=1
-	done
+	done <"$parts_file"
 fi
 
+# Fallback: no manifest (e.g. a partial/old install that predates it). Mask the
+# default `system` partition so stock GMS removal still happens rather than
+# silently doing nothing. This matches the manifest's default primary partition.
 if [ "$masked_any" = "0" ]; then
-	log_warn "post-fs-data: no overlay partitions under $MODDIR/system; nothing to mask"
+	log_warn "post-fs-data: no partition manifest at $parts_file; falling back to 'system'"
+	cleanup_stock_gms "system" "$engine"
 fi
 
 log_info "post-fs-data: done"

@@ -91,6 +91,17 @@ place_app() {
 		return 1
 	fi
 
+	# Defense-in-depth: refuse to operate with an empty name or partition. A
+	# truncated/blank value would make _pa_dir collapse to the parent priv-app
+	# dir (or even the partition root), so the rm -rf below could wipe a sibling
+	# component or the whole overlay instead of just this app. Guarding here keeps
+	# a bad components.conf row from turning placement into a destructive sweep.
+	if [ -z "$_pa_name" ] || [ -z "$_pa_part" ]; then
+		log_error "place_app: refusing to place with empty name ('$_pa_name') or partition ('$_pa_part')"
+		unset _pa_name _pa_asset _pa_part _pa_src
+		return 1
+	fi
+
 	_pa_dir="$(_place_overlay_root "$_pa_part")/priv-app/$_pa_name"
 	_pa_dest="$_pa_dir/$_pa_name.apk"
 
@@ -171,6 +182,17 @@ place_framework() {
 place_remove() {
 	_pr_name="$1"
 	_pr_part="$2"
+
+	# Defense-in-depth: an empty name or partition would make _pr_app_dir resolve
+	# to the parent priv-app dir (or the partition root), so the rm -rf below
+	# could delete every sibling component instead of just this one. Bail out
+	# rather than risk wiping a parent dir from a truncated argument.
+	if [ -z "$_pr_name" ] || [ -z "$_pr_part" ]; then
+		log_warn "place_remove: refusing to remove with empty name ('$_pr_name') or partition ('$_pr_part')"
+		unset _pr_name _pr_part
+		return 0
+	fi
+
 	_pr_root="$(_place_overlay_root "$_pr_part")"
 	_pr_app_dir="$_pr_root/priv-app/$_pr_name"
 	_pr_fw_jar="$_pr_root/framework/$_pr_name.jar"
