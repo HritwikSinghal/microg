@@ -232,7 +232,10 @@ def load_platform_perms(paths: list[Path]) -> dict[str, str]:
     UNION of their '|'-flags so the privileged flag is never lost across levels
     (under-listing bootloops; over-listing is harmless -- spec 6.1).
     """
-    merged: dict[str, set[str]] = {}
+    # Order-preserving union: keep flags in first-seen order (so a single source
+    # round-trips verbatim and matches the raw AOSP parse path) while still
+    # deduping and never dropping the privileged flag across merged levels.
+    merged: dict[str, list[str]] = {}
     for path in paths:
         if not path.is_file():
             continue
@@ -247,9 +250,11 @@ def load_platform_perms(paths: list[Path]) -> dict[str, str]:
                 )
             name, level = line.split("\t", 1)
             name = name.strip()
-            flags = {f for f in level.strip().split("|") if f}
-            merged.setdefault(name, set()).update(flags)
-    return {name: "|".join(sorted(flags)) for name, flags in merged.items()}
+            flags = merged.setdefault(name, [])  # registers empty-level names too
+            for f in level.strip().split("|"):
+                if f and f not in flags:
+                    flags.append(f)
+    return {name: "|".join(flags) for name, flags in merged.items()}
 
 
 def privileged_names(table: dict[str, str]) -> set[str]:
@@ -267,8 +272,19 @@ def _platform_perms_paths(api: int, data_dir: Path) -> list[Path]:
 
     Union semantics (spec 6.1): every PINNED level <= api whose file exists. A
     missing target-API table is a hard error so a typo never yields an empty,
-    bootloop-inducing allowlist; lower-level files are optional.
+    bootloop-inducing allowlist; lower-level files are optional. A target API
+    ABOVE every pinned level is also a hard error: silently reusing the newest
+    pinned table for an unpinned API could under-list a perm that became
+    privileged later, which bootloops under enforce -- fail loud so the pinned
+    tables get extended instead.
     """
+    if api > max(PINNED_APIS):
+        raise GenPermsError(
+            f"target API {api} is above every pinned platform-perms table "
+            f"(pinned levels are {', '.join(map(str, PINNED_APIS))}); add a "
+            f"data/platform-perms-{api}.txt via extract-perms rather than "
+            f"reusing stale data."
+        )
     levels = sorted(level for level in PINNED_APIS if level <= api)
     if not levels:
         raise GenPermsError(
